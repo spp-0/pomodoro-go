@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"html/template"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -92,6 +93,13 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	})
 	if err != nil || w == nil {
 		return err
+	}
+
+	// 关键：把"强制置顶 + 抢焦点 + 任务栏闪烁"排到 webview2 的 UI 线程。
+	// 必须发生在 w.Run() 启动事件循环之后才真正执行；w.Dispatch 是异步的，
+	// 任务会被 Run() 启动后取出执行。
+	if opt.TopMost {
+		w.Dispatch(func() { forceForegroundPopup(uintptr(w.Window())) })
 	}
 
 	done := make(chan struct{})
@@ -361,4 +369,82 @@ func getWorkArea() (winRect, bool) {
 		return r, false
 	}
 	return r, true
+}
+
+// ---------- Windows 强制置顶 + 抢焦点 ----------
+
+// forceForegroundPopup 把指定 HWND 的窗口拉到最前面、抢焦点，并闪烁任务栏
+// 图标兜底。解决"其他程序最大化时弹窗只出现在任务栏、屏幕上看不到"。
+// 仅在 Windows 上有实际效果；其它平台直接 no-op。
+//
+// 关键点：
+//  1. WindowStyle 库默认 WS_EX_TOPMOST=0 没置位，所以窗口很容易被全屏程序
+//     盖住。这里用 SetWindowPos(HWND_TOPMOST) 动态补上 topmost 标志。
+//  2. Windows 7+ 有"前台锁"（Foreground Lock Timeout），普通进程的
+//     SetForegroundWindow 会被系统静默拒掉。必须先 LockSetForegroundWindow(2)
+//     解锁，再 SetForegroundWindow 才能抢到焦点。
+//  3. 即便焦点没抢到（比如用户当前正在打字），也调 FlashWindowEx 闪任务栏
+//     图标，用户能从任务栏感知到。
+func forceForegroundPopup(hwnd uintptr) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	if hwnd == 0 {
+		return
+	}
+	const (
+		SW_SHOWNORMAL  = 1
+		SW_RESTORE     = 9
+		HWND_TOPMOST   = ^uintptr(0) // -1 as uintptr
+		SWP_NOMOVE     = 0x0002
+		SWP_NOSIZE     = 0x0001
+		SWP_SHOWWINDOW = 0x0040
+		LSFW_UNLOCK    = 2
+		FLASHW_ALL     = 3
+		FLASHW_TIMERNOFG = 12
+	)
+	user32 := syscall.NewLazyDLL("user32.dll")
+	procIsIconic := user32.NewProc("IsIconic")
+	procShowWindow := user32.NewProc("ShowWindow")
+	procSetWindowPos := user32.NewProc("SetWindowPos")
+	procBringToTop := user32.NewProc("BringWindowToTop")
+	procLockSetFG := user32.NewProc("LockSetForegroundWindow")
+	procSetFG := user32.NewProc("SetForegroundWindow")
+	procFlash := user32.NewProc("FlashWindowEx")
+
+	// 1) 若窗口被最小化，先还原；否则保险地 ShowWindow 一下，确保可见
+	if isIconic, _, _ := procIsIconic.Call(hwnd); isIconic != 0 {
+		procShowWindow.Call(hwnd, SW_RESTORE)
+	} else {
+		procShowWindow.Call(hwnd, SW_SHOWNORMAL)
+	}
+
+	// 2) 解除前台锁，让 SetForegroundWindow 真正生效
+	procLockSetFG.Call(LSFW_UNLOCK)
+
+	// 3) 设 TOPMOST 并刷到 Z 序最顶
+	procSetWindowPos.Call(
+		hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW,
+	)
+	// 4) 抢焦点
+	procBringToTop.Call(hwnd)
+	procSetFG.Call(hwnd)
+
+	// 5) 兜底：闪烁任务栏图标（即使焦点被系统拒掉也能让用户看到）
+	type flashInfo struct {
+		cbSize    uint32
+		hwnd      uintptr
+		dwFlags   uint32
+		uCount    uint32
+		dwTimeout uint32
+	}
+	var fi flashInfo
+	fi.cbSize = uint32(unsafe.Sizeof(fi))
+	fi.hwnd = hwnd
+	// FLASHW_ALL | FLASHW_TIMERNOFG：直到窗口变成前台才停止闪烁
+	fi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG
+	fi.uCount = 0 // 0 表示持续闪烁直到前台
+	fi.dwTimeout = 0
+	procFlash.Call(uintptr(unsafe.Pointer(&fi)))
 }
