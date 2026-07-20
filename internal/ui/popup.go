@@ -98,9 +98,8 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	// 关键：把"强制置顶 + 抢焦点 + 任务栏闪烁"排到 webview2 的 UI 线程。
 	// 必须发生在 w.Run() 启动事件循环之后才真正执行；w.Dispatch 是异步的，
 	// 任务会被 Run() 启动后取出执行。
-	if opt.TopMost {
-		w.Dispatch(func() { forceForegroundPopup(uintptr(w.Window())) })
-	}
+	// 无条件执行：用户需求"每次弹窗都显示"，不再依赖 opt.TopMost 配置。
+	w.Dispatch(func() { forceForegroundPopup(uintptr(w.Window())) })
 
 	done := make(chan struct{})
 	closed := make(chan struct{})

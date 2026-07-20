@@ -53,6 +53,15 @@ func (l *Logger) Printf(format string, args ...any) {
 		if _, err := f.ReadAt(head[:], 0); err == nil &&
 			head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF {
 			l.bomOK = true
+			return
+		}
+		// 文件已存在但没 BOM（升级前的旧日志被按 GBK 解释 → 乱码）：
+		// 截断到 0 并重写 BOM，让新日志从干净的 UTF-8 状态开始。
+		// 老日志内容已无法挽救（混了 GBK / UTF-8），清空是合理的迁移策略。
+		if err := f.Truncate(0); err == nil {
+			_, _ = f.Seek(0, 0)
+			_, _ = f.Write(utf8BOM)
+			l.bomOK = true
 		}
 	})
 
