@@ -19,10 +19,17 @@
 - **弹窗精美**：WebView2 渲染 HTML/CSS，渐变背景 + 卡片 + 倒计时 + ESC/Enter 关闭
 - **随机诗词/名言**：在线接口 `v1.hitokoto.cn` + 内置 14 句中文兜底
 - **配置热重载**：改 `config.json` 不需要重启；配置解析失败**降级为默认配置 + 弹窗提示**，绝不直接退出
-- **图形化设置窗口**：右键托盘 → 设置…，WebView2 渲染的设置页直接改番茄钟 / 时间点 / 声音 / 弹窗位置 / 诗词 API / 开机自启，原子保存并热重载
+- **图形化设置窗口**：右键托盘 → 设置…，WebView2 渲染的设置页直接改番茄钟 / 时间点 / 声音 / 天气 / 弹窗位置 / 诗词 API / 开机自启，原子保存并热重载
 - **提醒音**：可按 `popup.sound` 用系统默认提示音或自定义 wav
 - **开机自启**：托盘开关写入注册表 `HKCU\...\Run`（无新依赖）
 - **WebView2 兜底**：弹窗渲染失败时回退到系统消息框，提醒内容不丢失
+- **稍后提醒（Snooze）**：每个弹窗有「5/10/15 分钟」按钮，点击后到点重新触发（调度器内独立队列 `snooze`，不阻塞 tick）
+- **统计**：按本地日期记录完成的番茄钟数（`dist/stats.json`，保留 90 天）；托盘悬停显示「今日 N🍅」，设置页显示近 7 天
+- **托盘倒计时**：托盘 tooltip 实时显示当前相位（专注/休息/待命）+ 剩余时间 + 今日番茄数
+- **快捷预设**：设置页一键套用 25/5、50/10、90/20 番茄钟时长
+- **勿扰/会议模式**：托盘开关，抑制弹窗显示但**番茄钟继续计时**（与「暂停」不同，暂停会清空计时）
+- **跳过/延长休息**：托盘菜单「跳过当前休息」「延长休息 5 分钟」，仅休息阶段生效
+- **弹窗内天气**：弹窗顶部展示城市天气（Open-Meteo 免费接口，无需密钥），城市可在设置页自定义；断网时静默隐藏
 
 ---
 
@@ -48,17 +55,23 @@ pomodoro-go/
 │   │   └── logging.go
 │   ├── quote/                         # 在线 + 离线兜底语句
 │   │   └── quote.go
-│   ├── scheduler/                     # 调度器核心（线程安全）
+│   ├── scheduler/                     # 调度器核心（线程安全）：去重/相位/snooze/跳过延长/统计
 │   │   ├── scheduler.go
-│   │   └── scheduler_test.go          # 单测：去重/番茄钟相位/时区/热重载保留/旧格式兼容
+│   │   └── scheduler_test.go          # 单测：去重/相位/时区/热重载保留/snooze/跳过延长/统计
+│   ├── stats/                         # 按日期统计番茄钟与时间点（JSON 落盘）
+│   │   └── stats.go
+│   ├── weather/                       # 天气获取（Open-Meteo，无需密钥）
+│   │   ├── weather.go
+│   │   └── weather_test.go
 │   └── ui/                            # WebView2 弹窗 + 设置窗口
-│       ├── popup.go                   # ShowPopup + 声音 + 兜底消息框
+│       ├── popup.go                   # ShowPopup + 声音 + 天气 + snooze + 兜底消息框
 │       └── settings.go                # 图形化设置窗口（WebView2 渲染）
 ├── go.mod
 ├── go.sum
 ├── dist/
 │   ├── PomodoroNotifier.exe           # 编译产物
 │   ├── config.json                    # 运行时配置（exe 同目录，首次运行自动生成）
+│   ├── stats.json                     # 统计（按日期，自动生成）
 │   └── pomodoro.log                   # 运行日志（同目录）
 ├── README.md                          # 用户文档（面向终端用户）
 ├── ARCHITECTURE.md                    # 本文件
@@ -97,10 +110,14 @@ pomodoro-go/
 ```
 
 **外部依赖**：
-| 包 | 用途 | 备注 |
+| 包 / 服务 | 用途 | 备注 |
 |---|---|---|
 | `github.com/gogpu/systray` | 系统托盘 | 零 CGO，纯 Go |
 | `github.com/Krakinsight/go-webview2` | WebView2 弹窗 | 需要 Windows + WebView2 Runtime |
+| `Open-Meteo` (api.open-meteo.com) | 天气数据 | 在线 HTTP，无需 key；断网时天气静默隐藏 |
+| `v1.hitokoto.cn` | 在线诗词/名言 | 在线 HTTP，失败用内置兜底 |
+
+**内部依赖**：`scheduler` → `stats`（统计）；`ui` → `weather`（弹窗天气）；`main` → 全部。
 
 **为什么不引入 ORM/配置库/日志库**：
 - 配置就是 JSON，不用 viper
@@ -297,15 +314,16 @@ main()
 
 ---
 
-## 10. 后续工作（M3 及以后）
+## 10. 后续工作（M4 及以后）
 
-以下为尚未实现、设计上预留扩展点的功能（详见 [DEVELOPING.md](./DEVELOPING.md)）；**已完成的 M1+M2 项不再列出**：
+已完成：M1+M2（致命/体验修复）、本轮 M3 体验增强（**Snooze / 统计 / 托盘倒计时 / 快捷预设 / 勿扰模式 / 跳过·延长休息 / 弹窗内天气**）。
 
-- **snooze 按钮**：弹窗里"5/10/15 分钟后再提醒"
+剩余可选增强：
+
 - **多显示器支持**：用所在屏幕的 work area 计算位置（现为单显示器 work area）
-- **统计面板**：每天完成多少番茄钟、时间点命中次数
 - **不抢焦点 / 非置顶模式**：`popup.topmost=false` 时完全不打断当前窗口
-- **依赖瘦身**：当前 `go-webview2` 的小众 fork 拉入了 webgpu/cbor 等重传递依赖（二进制 ~14MB），可评估切回官方 `webview/webview2` 或自维护最小绑定
+- **依赖瘦身**：当前 `go-webview2` 的小众 fork 拉入了 webgpu/cbor 等重传递依赖（二进制 ~10MB），可评估切回官方 `webview/webview2` 或自维护最小绑定
+- **统计可视化增强**：周/月趋势图、导出 CSV
 - 多账号 / 多配置文件
 
 > 历史诊断与修复清单见 [PRODUCT_REVIEW.md](./PRODUCT_REVIEW.md)。

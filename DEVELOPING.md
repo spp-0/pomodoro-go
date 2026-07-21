@@ -397,10 +397,23 @@ Get-Process -Name PomodoroNotifier | Stop-Process
    - 重新加载配置菜单
    - 打开配置目录菜单
    - 退出菜单
-8. 改 `dist\config.json` 触发 reload，验证配置生效（且进行中的番茄钟不被重置）
+8. 改动 `dist\config.json` 触发 reload，验证配置生效（且进行中的番茄钟不被重置）
 9. 故意把 `config.json` 写错一个字符，确认程序弹窗提示并以默认配置启动（不崩溃退出）
 10. 把 `dist\PomodoroNotifier.exe` 单独拷给用户
    - 用户的 `config.json` / `pomodoro.log` 不要覆盖
+
+### M3 新功能专项验证
+
+新增的 7 项功能（Snooze / 统计 / 托盘倒计时 / 快捷预设 / 勿扰模式 / 跳过·延长休息 / 弹窗天气）上线前需逐一验证：
+
+- **Snooze（稍后提醒）**：弹窗出现后点击「5 分钟后再提醒」，确认弹窗关闭后约 5 分钟再次弹出同一提醒；DND 期间不触发。
+- **统计**：设置页「本周统计」区显示今日 🍅 数与最近 7 天数据；完成一个番茄钟后数字 +1；`dist\stats.json` 被正确写入（原子写、不会损坏）。
+- **托盘倒计时**：专注/休息进行中时，鼠标悬停托盘显示「🍅 专注中 · 剩余 Xs · 今日 N🍅」；进入休息阶段后文案变为「☕ 休息中」。
+- **快捷预设**：设置页点「25/5」「50/10」「90/20」预设，确认时长字段同步更新并保存后下一轮生效。
+- **勿扰 / 会议模式**：托盘菜单勾选「勿扰模式」，确认到点不再弹窗（计时仍在后台走）；取消勾选后恢复弹窗。勿扰 ≠ 暂停（暂停会清空计时，勿扰不会）。
+- **跳过 / 延长休息**：休息进行中时，托盘菜单「跳过当前休息」立即进入下一轮专注；「延长休息 5 分钟」使剩余时间 +5 分钟。
+- **弹窗天气**：设置页开启天气并填城市，弹窗内显示天气图标 + 城市 + 温度 + 文字；网络异常时静默失败（弹窗正常，无天气块）；改城市后重新弹窗显示新城市天气。
+- **回归**：以上任一切换 / 重载配置后，进行中的番茄钟不被重置，托盘 tooltip 不出现卡死或重复弹窗。
 
 ---
 
@@ -415,6 +428,9 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 | 改弹窗样式 | `internal/ui/popup.go` | `pageTemplate` |
 | 改弹窗位置算法 | `internal/ui/popup.go` | `computeLocation` |
 | 加新托盘菜单 | `cmd/pomodoro-agent/main.go` | `buildMenu` |
+| 改天气数据源 | `internal/weather/weather.go` | `Fetch` / `describe` |
+| 改统计存储 | `internal/stats/stats.go` | `RecordPomodoro` / `Today` / `Last7` |
+| 改稍后提醒/跳过/延长 | `internal/scheduler/scheduler.go` | `Snooze` / `SkipBreak` / `ExtendBreak` / `PomodoroStatus` |
 | 改托盘图标 | `cmd/gentray/main.go` | `themes` 字典 |
 | 改 UI 线程策略 | `cmd/pomodoro-agent/main.go` | `startUIDispatcher` |
 | 改日志格式 | `internal/logging/logging.go` | `Printf` |

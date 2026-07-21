@@ -18,6 +18,7 @@ import (
 	"pomodoro-notifier/internal/logging"
 	"pomodoro-notifier/internal/quote"
 	"pomodoro-notifier/internal/scheduler"
+	"pomodoro-notifier/internal/stats"
 	"pomodoro-notifier/internal/ui"
 )
 
@@ -78,6 +79,9 @@ func main() {
 	logger := logging.New(cfg.LogFile)
 	logger.Printf("start config=%s", path)
 
+	// 统计存储（按日期记录完成的番茄钟与时间点命中），落盘到 exe 同目录 stats.json
+	store := stats.New(filepath.Join(filepath.Dir(path), "stats.json"))
+
 	// 启动时按配置同步开机自启注册表项（幂等）。
 	if err := setAutostart(cfg.Autostart); err != nil {
 		logger.Printf("setAutostart: %v", err)
@@ -116,7 +120,9 @@ func main() {
 	}
 
 	var paused atomic.Bool
+	var dnd atomic.Bool // 勿扰/会议模式：抑制弹窗显示，但不影响番茄钟相位推进
 	sched := scheduler.New(cfg, loc, nil) // 先创建，emit 后面赋上
+	sched.SetStats(store)
 	scheduler.TickDebugf = func(format string, args ...any) {
 		logger.Printf("[tick] "+format, args...)
 	}
@@ -124,6 +130,10 @@ func main() {
 		logger.Printf("[emit] called kind=%s title=%q", e.Kind, e.Title)
 		if paused.Load() {
 			logger.Printf("[emit] suppressed by paused flag")
+			return
+		}
+		if dnd.Load() {
+			logger.Printf("[emit] suppressed by DND (勿扰) flag")
 			return
 		}
 		// 关键：每次触发都从 sched 取最新 cfg，确保热重载生效
@@ -145,6 +155,12 @@ func main() {
 			Loc:              loc,
 			SoundEnabled:     cur.Popup.Sound.Enabled,
 			SoundFile:        cur.Popup.Sound.File,
+			OnSnooze: func(mins int) {
+				sched.Snooze(e, time.Duration(mins)*time.Minute)
+				logger.Printf("[emit] snoozed %s for %d min", e.Kind, mins)
+			},
+			WeatherEnabled: cur.Weather.Enabled,
+			WeatherCity:    cur.Weather.City,
 		}}:
 			logger.Printf("[emit] enqueued to UI dispatcher")
 		default:
@@ -160,20 +176,11 @@ func main() {
 	// webview2 库的 Run() 必须阻塞在同一个 OS 线程。
 	startUIDispatcher(logger, sched, quoteTimeout)
 
-	// 调度主循环
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for now := range ticker.C {
-			sched.Tick(now)
-		}
-	}()
-
 	// 启动托盘消息循环（阻塞直到退出）
 	tray := systray.New()
 	applyTrayState(tray, scheduler.StateIdle, &paused)
 	tray.SetTooltip("🍅 PomodoroNotifier")
-	menu := buildMenu(tray, path, sched, logger, &paused)
+	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store)
 	tray.SetMenu(menu)
 
 	// 注册 scheduler 状态切换 → 切托盘图标
@@ -184,6 +191,16 @@ func main() {
 		}
 		applyTrayState(tray, display, &paused)
 	})
+
+	// 调度主循环：每秒推进调度，并刷新托盘 tooltip（相位剩余 + 今日番茄数）。
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for now := range ticker.C {
+			sched.Tick(now)
+			updateTrayTooltip(tray, sched, store, &dnd, now)
+		}
+	}()
 
 	tray.OnClick(func() { emitManual(sched) })
 	tray.Show()
@@ -216,6 +233,26 @@ func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic
 	tray.SetTooltip(tip)
 }
 
+// updateTrayTooltip 每秒刷新托盘悬浮提示：相位剩余时间 + 今日番茄数。
+func updateTrayTooltip(tray *systray.SystemTray, sched *scheduler.ServiceScheduler, store *stats.Store, dnd *atomic.Bool, now time.Time) {
+	if dnd.Load() {
+		tray.SetTooltip("🌙 PomodoroNotifier - 勿扰中（会议）")
+		return
+	}
+	phase, remaining := sched.PomodoroStatus(now)
+	today := store.Today().Pomodoros
+	var tip string
+	switch phase {
+	case "work":
+		tip = fmt.Sprintf("🍅 专注中 · 剩余 %s · 今日 %d🍅", remaining.Round(time.Second), today)
+	case "break":
+		tip = fmt.Sprintf("☕ 休息中 · 剩余 %s · 今日 %d🍅", remaining.Round(time.Second), today)
+	default:
+		tip = fmt.Sprintf("🍅 待命 · 今日 %d🍅", today)
+	}
+	tray.SetTooltip(tip)
+}
+
 func resolveConfigPath(flagPath string) (string, error) {
 	if flagPath != "" {
 		return filepath.Clean(flagPath), nil
@@ -223,10 +260,10 @@ func resolveConfigPath(flagPath string) (string, error) {
 	return config.DefaultConfigPath()
 }
 
-func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool) *systray.Menu {
+func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) *systray.Menu {
 	m := systray.NewMenu()
 	m.Add("立即弹一次", func() { emitManual(sched) })
-	m.Add("设置…", func() { openSettings(cfgPath, sched, logger) })
+	m.Add("设置…", func() { openSettings(cfgPath, sched, logger, store) })
 	m.AddSeparator()
 	m.AddCheckbox("暂停调度（点击切换）", false, func() {
 		if paused.Load() {
@@ -239,6 +276,30 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 			sched.Pause()
 			logger.Printf("paused")
 			applyTrayState(tray, scheduler.StateIdle, paused)
+		}
+	})
+	m.AddCheckbox("勿扰模式（会议）", dnd.Load(), func() {
+		enabled := !dnd.Load()
+		dnd.Store(enabled)
+		if enabled {
+			tray.ShowNotification("PomodoroNotifier", "已进入勿扰模式，提醒暂不弹窗（番茄钟继续计时）")
+		} else {
+			tray.ShowNotification("PomodoroNotifier", "已退出勿扰模式")
+		}
+		logger.Printf("dnd=%v", enabled)
+	})
+	m.Add("跳过当前休息", func() {
+		if ok := sched.SkipBreak(); !ok {
+			showInfo("跳过休息", "当前不在休息阶段，无法跳过。")
+		} else {
+			logger.Printf("skip break")
+		}
+	})
+	m.Add("延长休息 5 分钟", func() {
+		if ok := sched.ExtendBreak(5); !ok {
+			showInfo("延长休息", "当前不在休息阶段，无法延长。")
+		} else {
+			logger.Printf("extend break 5min")
 		}
 	})
 	m.AddCheckbox("声音", sched.CurrentConfig().Popup.Sound.Enabled, func() {
@@ -289,12 +350,12 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 }
 
 // openSettings 打开设置窗口；保存成功后通过 onSaved 做附带副作用（如同步开机自启）。
-func openSettings(cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger) {
+func openSettings(cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, store *stats.Store) {
 	ui.ShowSettings(cfgPath, sched, logger, func(cfg config.AppConfig) {
 		if err := setAutostart(cfg.Autostart); err != nil {
 			showInfo("开机自启", "设置失败: "+err.Error())
 		}
-	})
+	}, store)
 }
 
 // startUIDispatcher 在独立 goroutine 锁定 OS 线程，按顺序消费 popupQueue。

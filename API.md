@@ -19,7 +19,13 @@ type AppConfig struct {
     Popup      PopupConfig
     Pomodoro   PomodoroConfig
     Timepoint  TimepointConfig
+    Weather    WeatherConfig
     Autostart  bool             `json:"autostart"`   // 是否开机自启（写入 HKCU Run）
+}
+
+type WeatherConfig struct {
+    Enabled bool   `json:"enabled"` // 弹窗内是否显示天气
+    City    string `json:"city"`    // 城市名（Open-Meteo 地理编码，支持中英文）
 }
 
 type QuoteAPIConfig struct {
@@ -245,6 +251,26 @@ type ServiceScheduler struct { /* 私有 */ }
 - 返回当前生效配置（深拷贝按值语义）
 - **emit 闭包必须用这个**，不能用闭包捕获的 cfg 副本
 
+#### `(s *ServiceScheduler) SetStats(store *stats.Store)`
+- 注入统计存储（可为 nil，表示不记录统计）
+- 工作→休息转换时记录 `RecordPomodoro(dayKey)`，时间点命中时记录 `RecordTimepoint(dayKey)`
+
+#### `(s *ServiceScheduler) Snooze(e PopupEvent, delay time.Duration)`
+- 把事件推迟 `delay` 后重新触发（加入 `snooze` 队列）
+- 到期由 `Tick` 重新 emit（基于注入时钟 `nowFunc`，默认 `time.Now`）
+- 线程安全 ✅
+
+#### `(s *ServiceScheduler) SkipBreak() bool`
+- 立即结束当前休息进入下一个工作阶段
+- 仅 `phase == "break"` 时生效，返回是否执行
+
+#### `(s *ServiceScheduler) ExtendBreak(mins int) bool`
+- 把当前休息延长 `mins` 分钟
+- 仅 `phase == "break"` 时生效，返回是否执行
+
+#### `(s *ServiceScheduler) PomodoroStatus(now time.Time) (phase string, remaining time.Duration)`
+- 返回当前番茄钟相位（`"idle"`/`"work"`/`"break"`）与剩余时间
+
 ### 4.3 全局变量
 
 #### `var TickDebugf = func(format string, args ...any) {}`
@@ -307,6 +333,9 @@ type Options struct {
     Loc             *time.Location // 弹窗时间显示所用时区；nil 回退 time.Local
     SoundEnabled    bool    // 是否播放提醒音
     SoundFile       string  // 自定义 wav；空=系统默认提示音
+    OnSnooze        func(minutes int) // 非 nil 时显示「稍后提醒」按钮（5/10/15 分）
+    WeatherEnabled  bool    // 是否在弹窗内显示天气
+    WeatherCity     string  // 天气城市
 }
 
 type data struct { /* 私有，渲染到 HTML 用 */ }
@@ -379,7 +408,8 @@ main 包**不是公开 API**，但有些"内部约定"新 agent 要知道。
 | `main()` | 45-178 | 入口；启动顺序见 [ARCHITECTURE §7](./ARCHITECTURE.md#7-启动流程maingo) |
 | `startUIDispatcher(logger, sched, quoteTimeout)` | — | 启动 LockOSThread 的 goroutine，消费 popupQueue 并在其中异步取诗词 |
 | `applyTrayState(tray, st, paused)` | 181-201 | 切换托盘图标 + tooltip |
-| `buildMenu(tray, cfgPath, sched, logger, paused)` | 210-240 | 构建托盘菜单 |
+| `buildMenu(tray, cfgPath, sched, logger, paused, dnd, store)` | — | 构建托盘菜单（含 暂停 / 勿扰 / 跳过休息 / 延长休息 / 声音 / 开机自启） |
+| `updateTrayTooltip(tray, sched, store, dnd, now)` | — | 每秒刷新托盘 tooltip（相位剩余 + 今日番茄数；勿扰时显示专属提示） |
 | `emitManual(sched)` | 261-281 | 立即弹一次 |
 | `reloadConfig(path, sched, logger)` | 283-295 | 读 JSON + UpdateConfig |
 | `watchConfig(path, sched, logger)` | 297-313 | 2s 一次 mtime 检查 |
@@ -415,3 +445,39 @@ m.Add("我的新功能", func() {
 1. 编辑 `cmd/gentray/main.go` 改主题色
 2. 跑 `go run .\cmd\gentray` 重新生成 PNG
 3. 重新 `go build -ldflags "-H windowsgui -s -w" -o .\dist\PomodoroNotifier.exe .\cmd\pomodoro-agent`
+
+---
+
+## 7. `internal/weather`
+
+天气获取（Open-Meteo，无需 API key）。
+
+```go
+// Fetch 通过 Open-Meteo 获取城市当前天气：先地理编码 city→经纬度，再取 current_weather。
+// 任何一步失败返回 error，调用方应静默忽略（弹窗照常显示，只是不显示天气）。
+func Fetch(ctx context.Context, city string) (Weather, error)
+
+func TempString(t float64) string // "26°C"（四舍五入到整数度）
+```
+
+- `Weather` 结构：`City / Temperature / Code(WMO) / Text(中文文案) / Emoji`
+- 内部 `describe(code)` 把 WMO weather code 映射为 emoji + 中文文案
+- 调用方（`ui.ShowPopup`）在弹窗线程内带 1.5s 超时获取，失败不阻断提醒
+
+## 8. `internal/stats`
+
+按本地日期统计完成的番茄钟与命中的时间点（JSON 落盘）。
+
+```go
+func New(path string) *Store                  // 载入或新建
+func (s *Store) RecordPomodoro(date string)  // 记录 1 个完成的番茄钟
+func (s *Store) RecordTimepoint(date string) // 记录 1 次时间点命中
+func (s *Store) ForDate(date string) DayStat // 取某天统计
+func (s *Store) Today() DayStat               // 今天
+func (s *Store) Last7() []DayStat             // 最近 7 天（正序）
+```
+
+- `DayStat{ Pomodoros int; Timepoints int }`
+- 自带互斥锁；保存用「临时文件 + rename」原子写；自动剪枝 90 天
+- 由 `scheduler` 在番茄钟完成 / 时间点命中时调用（与 emit / 勿扰无关，反映真实触发）
+

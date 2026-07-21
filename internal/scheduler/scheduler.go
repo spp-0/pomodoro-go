@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"pomodoro-notifier/internal/config"
+	"pomodoro-notifier/internal/stats"
 )
 
 // PopupEvent 是要展示给用户的弹窗内容（不再走文件事件队列）。
@@ -44,6 +45,9 @@ type ServiceScheduler struct {
 	pomo    pomodoroState
 	lastT   map[string]map[string]bool // dayKey -> "HH:MM" -> already fired
 	lastLog map[string]bool            // dayKey+"HH:MM" -> already logged "already fired" today
+	snooze  []snoozeItem               // 待稍后提醒的事件
+	stats   *stats.Store               // 统计存储（可为 nil）
+	nowFunc func() time.Time           // 时钟（默认 time.Now，便于测试注入）
 	state   State
 	onState func(State) // 状态变更回调（必须非阻塞）
 }
@@ -53,6 +57,12 @@ type pomodoroState struct {
 	phase       string // "work" / "break"
 	nextAt      time.Time
 	lastWorkDay string
+}
+
+// snoozeItem 是“稍后提醒”队列中的一项：到点后重新 emit 原事件。
+type snoozeItem struct {
+	event  PopupEvent
+	fireAt time.Time
 }
 
 func New(cfg config.AppConfig, loc *time.Location, emit Emitter) *ServiceScheduler {
@@ -65,6 +75,7 @@ func New(cfg config.AppConfig, loc *time.Location, emit Emitter) *ServiceSchedul
 		emit:    emit,
 		lastT:   map[string]map[string]bool{},
 		lastLog: map[string]bool{},
+		nowFunc: time.Now,
 	}
 }
 
@@ -163,6 +174,95 @@ func (s *ServiceScheduler) SetEmitter(emit Emitter) {
 	s.emit = emit
 }
 
+// SetStats 注入统计存储（可为 nil，表示不记录统计）。
+func (s *ServiceScheduler) SetStats(store *stats.Store) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stats = store
+}
+
+// Snooze 把某个事件推迟 delay 后重新触发。
+// 线程安全：加入稍后队列，由 Tick 在到期时重新 emit。
+func (s *ServiceScheduler) Snooze(e PopupEvent, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snooze = append(s.snooze, snoozeItem{event: e, fireAt: s.nowFunc().Add(delay)})
+}
+
+// collectDueSnoozes 必须在调用前已复制 emit；返回到期事件并从队列移除。
+// 到期判断基于调度器的时钟 nowFunc()，与 Snooze 调用时一致。
+func (s *ServiceScheduler) collectDueSnoozesLocked() []PopupEvent {
+	ref := s.nowFunc()
+	var due []PopupEvent
+	keep := s.snooze[:0]
+	for _, it := range s.snooze {
+		if !ref.Before(it.fireAt) {
+			due = append(due, it.event)
+		} else {
+			keep = append(keep, it)
+		}
+	}
+	s.snooze = keep
+	return due
+}
+
+// SkipBreak 立即结束当前休息，进入下一个工作阶段。
+// 仅在处于 break 阶段时生效，返回是否执行了跳过。
+func (s *ServiceScheduler) SkipBreak() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pomo.active || s.pomo.phase != "break" {
+		return false
+	}
+	s.pomo.phase = "work"
+	s.pomo.nextAt = time.Now().In(s.loc)
+	s.setStateLocked(StateWork)
+	return true
+}
+
+// ExtendBreak 把当前休息延长 mins 分钟。
+// 仅在处于 break 阶段时生效，返回是否执行了延长。
+func (s *ServiceScheduler) ExtendBreak(mins int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pomo.active || s.pomo.phase != "break" || mins <= 0 {
+		return false
+	}
+	s.pomo.nextAt = s.pomo.nextAt.Add(time.Duration(mins) * time.Minute)
+	return true
+}
+
+// PomodoroStatus 返回当前番茄钟相位与剩余时间（基于 now）。
+// phase 为 "idle" / "work" / "break"；未启用或待命时为 "idle"，remaining 为 0。
+func (s *ServiceScheduler) PomodoroStatus(now time.Time) (phase string, remaining time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pomo.active {
+		return "idle", 0
+	}
+	rem := s.pomo.nextAt.Sub(now)
+	if rem < 0 {
+		rem = 0
+	}
+	return s.pomo.phase, rem
+}
+
+// recordPomodoro 与 recordTimepoint 在锁内调用，记录统计。
+func (s *ServiceScheduler) recordPomodoroLocked(dayKey string) {
+	if s.stats != nil {
+		s.stats.RecordPomodoro(dayKey)
+	}
+}
+
+func (s *ServiceScheduler) recordTimepointLocked(dayKey string) {
+	if s.stats != nil {
+		s.stats.RecordTimepoint(dayKey)
+	}
+}
+
 // CurrentConfig 返回当前生效的配置（线程安全）。
 // emit 等回调应从这里取最新配置，而不是捕获启动时的 cfg 副本，
 // 否则配置热重载不会反映在弹窗/调度行为上。
@@ -190,11 +290,18 @@ func (s *ServiceScheduler) Tick(now time.Time) {
 	cfg := s.cfg
 	loc := s.loc
 	emit := s.emit
+	nowIn := now.In(loc)
+	// 收集到期的“稍后提醒”事件（锁内收集，锁外 emit，避免死锁）
+	due := s.collectDueSnoozesLocked()
 	s.mu.Unlock()
 
-	now = now.In(loc)
-	s.tickTimepoints(cfg, now, emit)
-	s.tickPomodoro(cfg, now, emit)
+	s.tickTimepoints(cfg, nowIn, emit)
+	s.tickPomodoro(cfg, nowIn, emit)
+	for _, e := range due {
+		if emit != nil {
+			emit(e)
+		}
+	}
 }
 
 func (s *ServiceScheduler) tickPomodoro(cfg config.AppConfig, now time.Time, emit Emitter) {
@@ -247,6 +354,7 @@ func (s *ServiceScheduler) tickPomodoro(cfg config.AppConfig, now time.Time, emi
 		title := "🍅 休息时间到！"
 		msg := fmt.Sprintf("工作了 %d 分钟，休息 %d 分钟。%s", cfg.Pomodoro.WorkMinutes, cfg.Pomodoro.BreakMinutes, cfg.Pomodoro.BreakText)
 		toFire = append(toFire, PopupEvent{Kind: "pomodoro_break_start", Title: title, Message: msg, At: now})
+		s.recordPomodoroLocked(dayKey)
 		s.pomo.phase = "break"
 		s.pomo.nextAt = now.Add(time.Duration(cfg.Pomodoro.BreakMinutes) * time.Minute)
 		s.setStateLocked(StateBreak)
@@ -301,6 +409,7 @@ func (s *ServiceScheduler) tickTimepoints(cfg config.AppConfig, now time.Time, e
 		}
 		s.lastT[dayKey][minKey] = true
 		TickDebugf("timepoint FIRE: %s day=%s", minKey, dayKey)
+		s.recordTimepointLocked(dayKey)
 		title := strings.TrimSpace(it.Title)
 		if title == "" {
 			title = strings.TrimSpace(cfg.Timepoint.Title)

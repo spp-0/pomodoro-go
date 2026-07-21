@@ -95,6 +95,12 @@ type PopupConfig struct {
 	Sound            SoundConfig `json:"sound"`
 }
 
+// WeatherConfig 控制弹窗内天气信息。
+type WeatherConfig struct {
+	Enabled bool   `json:"enabled"` // 是否在弹窗内显示天气
+	City    string `json:"city"`    // 城市名（中文/英文均可，经 Open-Meteo 地理编码）
+}
+
 type AppConfig struct {
 	LogFile   string          `json:"log_file"`
 	TimeZone  string          `json:"timezone"`
@@ -102,6 +108,7 @@ type AppConfig struct {
 	Popup     PopupConfig     `json:"popup"`
 	Pomodoro  PomodoroConfig  `json:"pomodoro"`
 	Timepoint TimepointConfig `json:"timepoint"`
+	Weather   WeatherConfig   `json:"weather"`
 	Autostart bool            `json:"autostart"`
 }
 
@@ -142,6 +149,10 @@ func DefaultConfig() AppConfig {
 			},
 			Title:   "温馨提醒",
 			Message: "到点啦，起来走走，喝口水，看看远处。",
+		},
+		Weather: WeatherConfig{
+			Enabled: true,
+			City:    "北京",
 		},
 		Autostart: false,
 	}

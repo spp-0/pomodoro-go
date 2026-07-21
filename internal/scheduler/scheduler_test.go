@@ -2,10 +2,12 @@ package scheduler
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"pomodoro-notifier/internal/config"
+	"pomodoro-notifier/internal/stats"
 )
 
 func captureEmitter() (func(PopupEvent), *[]PopupEvent) {
@@ -151,5 +153,122 @@ func TestTimepointStringBackwardCompat(t *testing.T) {
 	}
 	if len(tp.Times) != 2 || tp.Times[0].Time != "10:30" || tp.Times[1].Time != "14:30" {
 		t.Fatalf("旧格式应解析为两项: %+v", tp.Times)
+	}
+}
+
+// Snooze：延迟到期后才重新触发，且只触发一次。
+func TestSnoozeReFiresOnce(t *testing.T) {
+	mock := time.Date(2026, 7, 20, 10, 0, 0, 0, time.Local)
+	cfg := baseConfig()
+	cfg.Pomodoro.Enabled = false
+	cfg.Timepoint.Enabled = false
+	emit, events := captureEmitter()
+	s := New(cfg, time.Local, emit)
+	s.nowFunc = func() time.Time { return mock } // 注入可控时钟
+
+	s.Snooze(PopupEvent{Kind: "manual", Title: "稍后"}, 10*time.Minute) // fireAt = mock+10min
+	s.Tick(mock)
+	if len(*events) != 0 {
+		t.Fatalf("snooze 不应提前触发，实际 %d", len(*events))
+	}
+	mock = mock.Add(11 * time.Minute) // 超过 fireAt
+	s.Tick(mock)
+	if len(*events) != 1 {
+		t.Fatalf("snooze 到期应触发一次，实际 %d", len(*events))
+	}
+	mock = mock.Add(1 * time.Minute)
+	s.Tick(mock)
+	if len(*events) != 1 {
+		t.Fatalf("snooze 只应触发一次，实际 %d", len(*events))
+	}
+}
+
+// SkipBreak / ExtendBreak：仅在 break 阶段生效。
+func TestSkipAndExtendBreak(t *testing.T) {
+	t0 := time.Date(2026, 7, 20, 9, 0, 0, 0, time.Local)
+	wd := int(t0.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	cfg := baseConfig()
+	cfg.Pomodoro.Enabled = true
+	cfg.Pomodoro.WorkMinutes = 1
+	cfg.Pomodoro.BreakMinutes = 1
+	cfg.Pomodoro.WorkDays = []int{wd}
+	emit, _ := captureEmitter()
+	s := New(cfg, time.Local, emit)
+
+	s.Tick(t0) // 进入 work
+	if s.SkipBreak() {
+		t.Fatalf("work 阶段 SkipBreak 应返回 false")
+	}
+	s.Tick(t0.Add(61 * time.Second)) // 进入 break
+	if s.State() != StateBreak {
+		t.Fatalf("应为 break，实际 %s", s.State())
+	}
+	before := s.pomo.nextAt
+	if !s.ExtendBreak(5) {
+		t.Fatalf("break 阶段 ExtendBreak 应返回 true")
+	}
+	if s.pomo.nextAt.Sub(before) < 4*time.Minute {
+		t.Fatalf("ExtendBreak 应延长约 5 分钟")
+	}
+	if !s.SkipBreak() {
+		t.Fatalf("break 阶段 SkipBreak 应返回 true")
+	}
+	if s.State() != StateWork {
+		t.Fatalf("SkipBreak 后应回到 work，实际 %s", s.State())
+	}
+	if s.ExtendBreak(5) {
+		t.Fatalf("work 阶段 ExtendBreak 应返回 false")
+	}
+}
+
+// 统计：完成一个番茄钟（work→break）应记录一次。
+func TestStatsRecording(t *testing.T) {
+	dir := t.TempDir()
+	store := stats.New(filepath.Join(dir, "stats.json"))
+	t0 := time.Date(2026, 7, 20, 9, 0, 0, 0, time.Local)
+	wd := int(t0.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	cfg := baseConfig()
+	cfg.Pomodoro.Enabled = true
+	cfg.Pomodoro.WorkMinutes = 1
+	cfg.Pomodoro.BreakMinutes = 1
+	cfg.Pomodoro.WorkDays = []int{wd}
+	emit, _ := captureEmitter()
+	s := New(cfg, time.Local, emit)
+	s.SetStats(store)
+
+	s.Tick(t0)
+	s.Tick(t0.Add(61 * time.Second)) // work→break，应记录 1 个番茄钟
+	got := store.ForDate("2026-07-20").Pomodoros
+	if got != 1 {
+		t.Fatalf("应记录 1 个番茄钟，实际 %d", got)
+	}
+}
+
+// PomodoroStatus 返回正确的相位与剩余时间。
+func TestPomodoroStatus(t *testing.T) {
+	t0 := time.Date(2026, 7, 20, 9, 0, 0, 0, time.Local)
+	wd := int(t0.Weekday())
+	if wd == 0 {
+		wd = 7
+	}
+	cfg := baseConfig()
+	cfg.Pomodoro.Enabled = true
+	cfg.Pomodoro.WorkMinutes = 25
+	cfg.Pomodoro.WorkDays = []int{wd}
+	emit, _ := captureEmitter()
+	s := New(cfg, time.Local, emit)
+	s.Tick(t0)
+	phase, rem := s.PomodoroStatus(t0.Add(5 * time.Minute))
+	if phase != "work" {
+		t.Fatalf("相位应为 work，实际 %s", phase)
+	}
+	if rem < 19*time.Minute || rem > 20*time.Minute {
+		t.Fatalf("剩余应约 20 分钟，实际 %v", rem)
 	}
 }
