@@ -343,7 +343,7 @@ type data struct { /* 私有，渲染到 HTML 用 */ }
 
 ### 5.2 函数
 
-#### `ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error`
+#### `ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.Logger) error`
 - 弹一个 WebView2 窗口
 - **同步阻塞**直到：
   - 用户点"知道了" → `closeWindow` JS 回调 → `w.Destroy()`
@@ -462,7 +462,8 @@ func TempString(t float64) string // "26°C"（四舍五入到整数度）
 
 - `Weather` 结构：`City / Temperature / Code(WMO) / Text(中文文案) / Emoji`
 - 内部 `describe(code)` 把 WMO weather code 映射为 emoji + 中文文案
-- 调用方（`ui.ShowPopup`）在弹窗线程内带 1.5s 超时获取，失败不阻断提醒
+- **HTTP 客户端强制 HTTP/1.1**（避免部分网络下 HTTP/2 握手挂起），每个请求 5s 客户端超时，并对网络/超时错误**重试一次**；`Fetch` 自身在调用方 ctx 之上再叠加 12s 总超时。
+- 调用方（`ui.ShowPopup`）**异步**获取天气：弹窗先立即显示，天气就绪后通过 `renderWeather(json)` 注入 DOM，失败不阻断提醒、并写入日志（`[weather] fetch failed: ...`）。
 
 ## 8. `internal/stats`
 

@@ -2,6 +2,7 @@ package weather
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -9,7 +10,41 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// httpClient 强制使用 HTTP/1.1。部分网络环境下 HTTP/2 握手会挂起，
+// 导致 open-meteo 请求长时间不返回；实测 HTTP/1.1 耗时约为 HTTP/2 的一半且更稳定。
+// 每个请求单独 5s 超时，避免单请求无限挂起。
+var httpClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	},
+}
+
+// getURL 发起 GET 请求，对网络/超时类错误重试一次（open-meteo 在部分网络下偶发抖动）。
+// 返回成功（2xx）的 *http.Response，调用方负责关闭 Body。
+func getURL(ctx context.Context, urlStr string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, urlStr)
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
 
 // Weather 表示某城市当前天气。
 type Weather struct {
@@ -29,27 +64,26 @@ func Fetch(ctx context.Context, city string) (Weather, error) {
 	if city == "" {
 		return Weather{}, fmt.Errorf("city is empty")
 	}
-	lat, lon, err := geocode(ctx, city)
+	// 地理编码 + 当前天气是两次串行网络请求，且各自内部还有一次重试
+	// （每次请求 5s 客户端超时）。给整次抓取一个充足的总超时（12s），
+	// 同时尊重调用方 ctx 的取消。注意：不要把调用方那个偏短的 context
+	// 直接作为硬上限，否则前一步请求消耗掉预算后，后一步必然超时。
+	fetchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	lat, lon, err := geocode(fetchCtx, city)
 	if err != nil {
 		return Weather{}, err
 	}
-	return fetchCurrent(ctx, lat, lon, city)
+	return fetchCurrent(fetchCtx, lat, lon, city)
 }
 
 func geocode(ctx context.Context, city string) (float64, float64, error) {
 	api := "https://geocoding-api.open-meteo.com/v1/search?count=1&language=zh&format=json&name=" + url.QueryEscape(city)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getURL(ctx, api)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, 0, fmt.Errorf("geocode status %d", resp.StatusCode)
-	}
 	var g struct {
 		Results []struct {
 			Latitude  float64 `json:"latitude"`
@@ -68,18 +102,11 @@ func geocode(ctx context.Context, city string) (float64, float64, error) {
 
 func fetchCurrent(ctx context.Context, lat, lon float64, city string) (Weather, error) {
 	api := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current_weather=true", lat, lon)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
-	if err != nil {
-		return Weather{}, err
-	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getURL(ctx, api)
 	if err != nil {
 		return Weather{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return Weather{}, fmt.Errorf("forecast status %d", resp.StatusCode)
-	}
 	var f struct {
 		CurrentWeather struct {
 			Temperature  float64 `json:"temperature"`

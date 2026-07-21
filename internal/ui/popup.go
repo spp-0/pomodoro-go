@@ -7,16 +7,26 @@ import (
 	"html/template"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/Krakinsight/go-webview2"
 
+	"pomodoro-notifier/internal/logging"
 	"pomodoro-notifier/internal/quote"
 	"pomodoro-notifier/internal/scheduler"
 	"pomodoro-notifier/internal/weather"
 )
+
+// weatherPayload 是异步注入到页面的天气数据；字段名即 JS 端读取的字段名。
+type weatherPayload struct {
+	Emoji string `json:"emoji"`
+	City  string `json:"city"`
+	Temp  string `json:"temp"`
+	Text  string `json:"text"`
+}
 
 type Options struct {
 	Width            int
@@ -44,11 +54,7 @@ type data struct {
 	Source        string
 	AutoClose     int
 	PayloadB64    string
-	SnoozeEnabled bool   // 是否显示“稍后提醒”按钮
-	WeatherEmoji  string // 天气 emoji（无则空）
-	WeatherCity   string
-	WeatherTemp   string // 如 "26°C"
-	WeatherText   string // 如 "多云"
+	SnoozeEnabled bool // 是否显示“稍后提醒”按钮
 }
 
 // friendlyBadge 把内部事件类型映射为面向用户的中文标签。
@@ -69,7 +75,7 @@ func friendlyBadge(kind string) string {
 	}
 }
 
-func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
+func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.Logger) error {
 	if opt.Width <= 0 {
 		opt.Width = 560
 	}
@@ -107,17 +113,6 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	}
 
 	d.SnoozeEnabled = opt.OnSnooze != nil
-	// 天气：在弹窗线程内异步取（带超时），失败静默忽略，不影响提醒本身。
-	if opt.WeatherEnabled && strings.TrimSpace(opt.WeatherCity) != "" {
-		wctx, wcancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
-		defer wcancel()
-		if w, werr := weather.Fetch(wctx, opt.WeatherCity); werr == nil {
-			d.WeatherEmoji = w.Emoji
-			d.WeatherCity = w.City
-			d.WeatherTemp = weather.TempString(w.Temperature)
-			d.WeatherText = w.Text
-		}
-	}
 
 	// 序列化一份 JSON 通过 base64 注入，页面里解码后做兜底渲染（避免模板转义问题）
 	payload, _ := json.Marshal(d)
@@ -148,7 +143,9 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 
 	done := make(chan struct{})
 	closed := make(chan struct{})
+	var closedFlag atomic.Bool // 弹窗是否已关闭（异步天气注入时用来防抖）
 	closeOnce := func() {
+		closedFlag.Store(true)
 		// 1) 关闭 webview 窗口
 		w.Destroy()
 		// 2) 通知 Run() 退出（不调 Terminate，避免它强行结束宿主进程）
@@ -172,6 +169,38 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	}
 
 	w.SetHtml(html)
+
+	// 天气：异步拉取，弹窗先立即显示，天气就绪后再注入 DOM。
+	// 这样即使网络慢/失败，也不会阻塞或吞掉提醒本身。失败静默忽略。
+	if opt.WeatherEnabled && strings.TrimSpace(opt.WeatherCity) != "" {
+		city := strings.TrimSpace(opt.WeatherCity)
+		go func() {
+			wctx, wcancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer wcancel()
+			wth, werr := weather.Fetch(wctx, city)
+			if werr != nil {
+				if log != nil {
+					log.Printf("[weather] fetch failed: %v", werr)
+				}
+				return
+			}
+			if closedFlag.Load() {
+				return
+			}
+			b, _ := json.Marshal(weatherPayload{
+				Emoji: wth.Emoji,
+				City:  wth.City,
+				Temp:  weather.TempString(wth.Temperature),
+				Text:  wth.Text,
+			})
+			js := "renderWeather(" + string(b) + ");"
+			// Eval 包在 Dispatch 里，确保在 webview 主线程执行。
+			w.Dispatch(func() {
+				w.Eval(js)
+			})
+		}()
+	}
+
 	if opt.SoundEnabled {
 		playNotificationSound(opt.SoundFile)
 	}
@@ -362,14 +391,6 @@ const pageTemplate = `<!doctype html>
       <span class="badge" id="kind">{{.Badge}}</span>
       <span id="title">{{.Title}}</span>
     </h2>
-    {{if .WeatherEmoji}}
-    <div class="weather" id="weather">
-      <span class="w-emoji">{{.WeatherEmoji}}</span>
-      <span class="w-city">{{.WeatherCity}}</span>
-      <span class="w-temp">{{.WeatherTemp}}</span>
-      <span class="w-text">{{.WeatherText}}</span>
-    </div>
-    {{end}}
     <div class="msg" id="msg">{{.Message}}</div>
     <div class="quote">
       <div class="text" id="qtext">{{.Quote}}</div>
@@ -392,6 +413,33 @@ const pageTemplate = `<!doctype html>
     </div>
   </div>
 <script>
+// 天气异步注入：Go 端拉到天气后调用 renderWeather(json)。
+// 使用 textContent 而非 innerHTML，避免任何注入风险。
+window.renderWeather = function(d){
+  if (!d) return;
+  var title = document.querySelector(".title");
+  if (!title) return;
+  var el = document.getElementById("weather");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "weather";
+    el.id = "weather";
+    title.insertAdjacentElement("afterend", el);
+  }
+  el.innerHTML = "";
+  function span(cls, txt){
+    if (txt === undefined || txt === null || txt === "") return;
+    var s = document.createElement("span");
+    s.className = cls;
+    s.textContent = txt;
+    el.appendChild(s);
+  }
+  span("w-emoji", d.emoji);
+  span("w-city", d.city);
+  span("w-temp", d.temp);
+  span("w-text", d.text);
+};
+
 (function(){
   // 通过 base64 注入的兜底数据，防止模板里出现空字符串
   var b64 = "{{.PayloadB64}}";

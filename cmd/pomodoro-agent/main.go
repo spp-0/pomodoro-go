@@ -104,7 +104,7 @@ func main() {
 			Position:         cfg.Popup.Position,
 			SoundEnabled:     cfg.Popup.Sound.Enabled,
 			SoundFile:        cfg.Popup.Sound.File,
-		})
+		}, logger)
 		return
 	}
 
@@ -370,7 +370,7 @@ func startUIDispatcher(logger *logging.Logger, sched *scheduler.ServiceScheduler
 			// 诗词在 dispatcher 协程里取，不阻塞调度 tick 协程。
 			q := fetchQuote(sched.CurrentConfig(), quoteTimeout, logger)
 			logger.Printf("[ui] quote: %q", q.Text)
-			err := ui.ShowPopup(job.e, q, job.opts)
+			err := ui.ShowPopup(job.e, q, job.opts, logger)
 			if err != nil {
 				logger.Printf("[ui] ShowPopup failed: %v", err)
 				// 兜底：弹窗渲染失败时，用系统消息框展示提醒内容，
