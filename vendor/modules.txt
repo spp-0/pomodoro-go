@@ -1,0 +1,45 @@
+# github.com/Krakinsight/go-webview2 v0.4.3
+## explicit; go 1.25.0
+github.com/Krakinsight/go-webview2
+github.com/Krakinsight/go-webview2/internal/w32
+github.com/Krakinsight/go-webview2/pkg/edge
+github.com/Krakinsight/go-webview2/webviewloader
+# github.com/fxamacker/cbor/v2 v2.9.1
+## explicit; go 1.20
+github.com/fxamacker/cbor/v2
+# github.com/go-webgpu/goffi v0.6.0
+## explicit; go 1.25
+github.com/go-webgpu/goffi/ffi
+github.com/go-webgpu/goffi/internal/arch
+github.com/go-webgpu/goffi/internal/arch/amd64
+github.com/go-webgpu/goffi/internal/arch/arm64
+github.com/go-webgpu/goffi/internal/dl
+github.com/go-webgpu/goffi/internal/fakecgo
+github.com/go-webgpu/goffi/internal/syscall
+github.com/go-webgpu/goffi/types
+# github.com/godbus/dbus/v5 v5.2.2
+## explicit; go 1.20
+github.com/godbus/dbus/v5
+github.com/godbus/dbus/v5/introspect
+github.com/godbus/dbus/v5/prop
+# github.com/gogpu/systray v0.1.2
+## explicit; go 1.25.0
+github.com/gogpu/systray
+github.com/gogpu/systray/internal
+github.com/gogpu/systray/internal/darwin
+# github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1
+## explicit; go 1.14
+github.com/jchv/go-winloader
+github.com/jchv/go-winloader/internal/loader
+github.com/jchv/go-winloader/internal/memloader
+github.com/jchv/go-winloader/internal/pe
+github.com/jchv/go-winloader/internal/vmem
+github.com/jchv/go-winloader/internal/winloader
+# github.com/x448/float16 v0.8.4
+## explicit; go 1.11
+github.com/x448/float16
+# golang.org/x/sys v0.47.0
+## explicit; go 1.25.0
+golang.org/x/sys/unix
+golang.org/x/sys/windows
+golang.org/x/sys/windows/registry

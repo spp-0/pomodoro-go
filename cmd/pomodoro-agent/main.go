@@ -408,6 +408,9 @@ func emitManual(sched *scheduler.ServiceScheduler) {
 			Loc:              loc,
 			SoundEnabled:     cur.Popup.Sound.Enabled,
 			SoundFile:        cur.Popup.Sound.File,
+			// 手动弹窗同样要带天气（与 emit 路径保持一致），否则手动提醒看不到天气。
+			WeatherEnabled: cur.Weather.Enabled,
+			WeatherCity:    cur.Weather.City,
 		},
 	}
 	select {

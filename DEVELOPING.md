@@ -437,7 +437,20 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 
 ---
 
-## 8. 常见错误信息
+## 8. 依赖补丁（vendor 中的 systray）
+
+`github.com/gogpu/systray` 已 vendor 进仓库（见 `vendor/`）。对其 `internal/platform_windows.go`
+的 `Show()` 与 `modifyIcon()` 打了一处补丁：在 `uFlags` 末尾追加 `nifShovel`
+（=`NIF_SHOWTIP` 0x80）。原因：Windows 7+ 下不设这个标志，托盘图标的悬停
+tooltip（`szTip`）会被系统抑制，表现为「鼠标悬停无提示」。
+
+> ⚠️ 重新执行 `go mod vendor` 会用上游源码覆盖 `vendor/`，把该补丁冲掉，
+> 托盘提示会再次失效。若必须重 vendor，请手动把 `nid.uFlags = nifMessage | nifIcon | nifTip | nifShovel`
+> 这行重新打上；升级 systray 版本时同理需重新评估。
+
+---
+
+## 9. 常见错误信息
 
 | 错误 | 原因 | 解决 |
 |---|---|---|
