@@ -55,6 +55,7 @@ type data struct {
 	AutoClose     int
 	PayloadB64    string
 	SnoozeEnabled bool // 是否显示“稍后提醒”按钮
+	WeatherEnabled bool // 是否在弹窗内显示天气（决定占位块）
 }
 
 // friendlyBadge 把内部事件类型映射为面向用户的中文标签。
@@ -113,6 +114,7 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 	}
 
 	d.SnoozeEnabled = opt.OnSnooze != nil
+	d.WeatherEnabled = opt.WeatherEnabled && strings.TrimSpace(opt.WeatherCity) != ""
 
 	// 序列化一份 JSON 通过 base64 注入，页面里解码后做兜底渲染（避免模板转义问题）
 	payload, _ := json.Marshal(d)
@@ -180,7 +182,12 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 			wth, werr := weather.Fetch(wctx, city)
 			if werr != nil {
 				if log != nil {
-					log.Printf("[weather] fetch failed: %v", werr)
+					log.Printf("[weather] fetch failed for city=%s: %v", city, werr)
+				}
+				if !closedFlag.Load() {
+					w.Dispatch(func() {
+						w.Eval("renderWeatherError('天气获取失败');")
+					})
 				}
 				return
 			}
@@ -375,6 +382,7 @@ const pageTemplate = `<!doctype html>
     .weather .w-emoji{ font-size:18px; }
     .weather .w-temp{ font-weight:600; color:#bae6fd; }
     .weather .w-text{ color:#93c5fd; }
+    .weather .w-loading{ color:#93c5fd; font-style:italic; }
     .snooze{
       display:flex; align-items:center; gap:8px; margin:10px 0 4px 0; flex-wrap:wrap;
     }
@@ -392,6 +400,9 @@ const pageTemplate = `<!doctype html>
       <span id="title">{{.Title}}</span>
     </h2>
     <div class="msg" id="msg">{{.Message}}</div>
+    {{if .WeatherEnabled}}
+    <div class="weather" id="weather"><span class="w-loading">正在获取天气…</span></div>
+    {{end}}
     <div class="quote">
       <div class="text" id="qtext">{{.Quote}}</div>
       <div class="meta" id="qmeta">— {{.Author}}{{if .Source}} · {{.Source}}{{end}}</div>
@@ -413,12 +424,11 @@ const pageTemplate = `<!doctype html>
     </div>
   </div>
 <script>
-// 天气异步注入：Go 端拉到天气后调用 renderWeather(json)。
+// 天气异步注入：Go 端拉到天气后调用 renderWeather(json)，失败调用 renderWeatherError(text)。
 // 使用 textContent 而非 innerHTML，避免任何注入风险。
-window.renderWeather = function(d){
-  if (!d) return;
+function ensureWeatherEl(){
   var title = document.querySelector(".title");
-  if (!title) return;
+  if (!title) return null;
   var el = document.getElementById("weather");
   if (!el) {
     el = document.createElement("div");
@@ -427,17 +437,31 @@ window.renderWeather = function(d){
     title.insertAdjacentElement("afterend", el);
   }
   el.innerHTML = "";
-  function span(cls, txt){
-    if (txt === undefined || txt === null || txt === "") return;
-    var s = document.createElement("span");
-    s.className = cls;
-    s.textContent = txt;
-    el.appendChild(s);
-  }
-  span("w-emoji", d.emoji);
-  span("w-city", d.city);
-  span("w-temp", d.temp);
-  span("w-text", d.text);
+  return el;
+}
+function appendSpan(el, cls, txt){
+  if (!el || txt === undefined || txt === null || txt === "") return;
+  var s = document.createElement("span");
+  s.className = cls;
+  s.textContent = txt;
+  el.appendChild(s);
+}
+window.renderWeather = function(d){
+  if (!d) return;
+  var el = ensureWeatherEl();
+  if (!el) return;
+  appendSpan(el, "w-emoji", d.emoji);
+  appendSpan(el, "w-city", d.city);
+  appendSpan(el, "w-temp", d.temp);
+  appendSpan(el, "w-text", d.text);
+};
+window.renderWeatherError = function(text){
+  var el = ensureWeatherEl();
+  if (!el) return;
+  var s = document.createElement("span");
+  s.className = "w-loading";
+  s.textContent = text || "天气获取失败";
+  el.appendChild(s);
 };
 
 (function(){

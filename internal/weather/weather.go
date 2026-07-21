@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,13 +14,22 @@ import (
 	"time"
 )
 
-// httpClient 强制使用 HTTP/1.1。部分网络环境下 HTTP/2 握手会挂起，
-// 导致 open-meteo 请求长时间不返回；实测 HTTP/1.1 耗时约为 HTTP/2 的一半且更稳定。
-// 每个请求单独 5s 超时，避免单请求无限挂起。
+// httpClient 强制使用 HTTP/1.1，并优先尝试 IPv4。
+// 经验：部分国内网络对海外域名走 IPv6 会长时间挂起，而 IPv4 可正常连通；
+// HTTP/2 在这些链路上也偶发抖动。实测 IPv4 + HTTP/1.1 最稳。
+// 每个请求 5s 客户端超时，避免单请求无限挂起。
 var httpClient = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
 		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// 优先 IPv4；若失败再回退到默认双栈。
+			d := &net.Dialer{Timeout: 5 * time.Second}
+			if conn, err := d.DialContext(ctx, "tcp4", addr); err == nil {
+				return conn, nil
+			}
+			return d.DialContext(ctx, network, addr)
+		},
 	},
 }
 
