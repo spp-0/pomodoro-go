@@ -25,7 +25,7 @@ type AppConfig struct {
 
 type WeatherConfig struct {
     Enabled bool   `json:"enabled"` // 弹窗内是否显示天气
-    City    string `json:"city"`    // 城市名（Open-Meteo 地理编码，支持中英文）
+    City    string `json:"city"`    // 城市名（支持中文/拼音/英文；常见中国城市已内置坐标）
 }
 
 type QuoteAPIConfig struct {
@@ -450,11 +450,11 @@ m.Add("我的新功能", func() {
 
 ## 7. `internal/weather`
 
-天气获取（Open-Meteo，无需 API key）。
+天气获取（Open-Meteo，无需 API key；常见中国城市已内置坐标，避免其 geocoding 对中文地名支持不佳）。
 
 ```go
-// Fetch 通过 Open-Meteo 获取城市当前天气：先地理编码 city→经纬度，再取 current_weather。
-// 任何一步失败返回 error，调用方应静默忽略（弹窗照常显示，只是不显示天气）。
+// Fetch 获取城市当前天气：先查内置中文城市坐标表，未命中再走 Open-Meteo 地理编码；最后取 current_weather。
+// 任何一步失败返回 error，调用方应静默忽略（弹窗照常显示，只是天气块显示“天气获取失败”）。
 func Fetch(ctx context.Context, city string) (Weather, error)
 
 func TempString(t float64) string // "26°C"（四舍五入到整数度）
@@ -462,7 +462,8 @@ func TempString(t float64) string // "26°C"（四舍五入到整数度）
 
 - `Weather` 结构：`City / Temperature / Code(WMO) / Text(中文文案) / Emoji`
 - 内部 `describe(code)` 把 WMO weather code 映射为 emoji + 中文文案
-- **HTTP 客户端强制 HTTP/1.1**（避免部分网络下 HTTP/2 握手挂起），每个请求 5s 客户端超时，并对网络/超时错误**重试一次**；`Fetch` 自身在调用方 ctx 之上再叠加 12s 总超时。
+- **内置 `cityCoordinates` 表**：覆盖北京、上海、广州、深圳、杭州等 40+ 个常见城市，支持中文名和拼音/英文别名；解决 Open-Meteo geocoding 对部分中文城市返回 `city not found` 的问题。
+- **HTTP 客户端强制优先 IPv4 + HTTP/1.1**（避免部分网络下 IPv6/HTTP/2 握手挂起），每个请求 5s 客户端超时，并对网络/超时错误**重试一次**；`Fetch` 自身在调用方 ctx 之上再叠加 12s 总超时。
 - 调用方（`ui.ShowPopup`）**异步**获取天气：弹窗先立即显示，天气就绪后通过 `renderWeather(json)` 注入 DOM，失败不阻断提醒、并写入日志（`[weather] fetch failed: ...`）。
 
 ## 8. `internal/stats`

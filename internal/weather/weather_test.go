@@ -32,3 +32,26 @@ func TestTempString(t *testing.T) {
 		t.Fatalf("-2.6 应格式化为 -3°C，实际 %s", TempString(-2.6))
 	}
 }
+
+func TestLookupCoord(t *testing.T) {
+	cases := []struct {
+		city      string
+		wantFound bool
+	}{
+		{"北京", true},
+		{"beijing", true},
+		{"上海", true},
+		{"shanghai", true},
+		{"UnknownCity", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		coord, found := lookupCoord(c.city)
+		if found != c.wantFound {
+			t.Fatalf("lookupCoord(%q) found=%v, want=%v", c.city, found, c.wantFound)
+		}
+		if found && coord.lat == 0 && coord.lon == 0 {
+			t.Fatalf("lookupCoord(%q) 命中但坐标为零", c.city)
+		}
+	}
+}
