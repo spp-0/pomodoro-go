@@ -77,7 +77,11 @@ func (s *ServiceScheduler) UpdateConfig(cfg config.AppConfig, loc *time.Location
 	// 配置改变后清空当天的“已触发”标记，这样新的时间点列表可以立即生效。
 	s.lastT = map[string]map[string]bool{}
 	s.lastLog = map[string]bool{}
-	s.pomo = pomodoroState{}
+	// 仅在番茄钟被关闭时才清空进行中的番茄钟；否则保留当前相位/nextAt，
+	// 避免用户改配置（如调整时间点）时正在计时的番茄钟被重置。
+	if !cfg.Pomodoro.Enabled {
+		s.pomo = pomodoroState{}
+	}
 	emit := s.emit
 	now := time.Now().In(s.loc)
 	dayKey := now.Format("2006-01-02")
@@ -97,8 +101,8 @@ func (s *ServiceScheduler) fireImmediateTimepointsLocked(tp config.TimepointConf
 	if !tp.Enabled || emit == nil {
 		return
 	}
-	for _, hm := range tp.Times {
-		h, m, err := parseHM(hm)
+	for _, it := range tp.Times {
+		h, m, err := parseHM(it.Time)
 		if err != nil {
 			continue
 		}
@@ -110,12 +114,18 @@ func (s *ServiceScheduler) fireImmediateTimepointsLocked(tp config.TimepointConf
 			continue
 		}
 		s.lastT[dayKey][minKey] = true
-		title := tp.Title
-		if strings.TrimSpace(title) == "" {
+		title := strings.TrimSpace(it.Title)
+		if title == "" {
+			title = strings.TrimSpace(tp.Title)
+		}
+		if title == "" {
 			title = "温馨提醒"
 		}
-		msg := tp.Message
-		if strings.TrimSpace(msg) == "" {
+		msg := strings.TrimSpace(it.Message)
+		if msg == "" {
+			msg = strings.TrimSpace(tp.Message)
+		}
+		if msg == "" {
 			msg = "到点啦，起来走走。"
 		}
 		emit(PopupEvent{Kind: "timepoint", Title: title, Message: msg, At: now})
@@ -269,18 +279,19 @@ func (s *ServiceScheduler) tickTimepoints(cfg config.AppConfig, now time.Time, e
 	if _, ok := s.lastT[dayKey]; !ok {
 		s.lastT[dayKey] = map[string]bool{}
 	}
-	for _, hm := range cfg.Timepoint.Times {
-		h, m, err := parseHM(hm)
+	for _, it := range cfg.Timepoint.Times {
+		h, m, err := parseHM(it.Time)
 		if err != nil {
-			TickDebugf("timepoint parse failed: %q err=%v", hm, err)
+			TickDebugf("timepoint parse failed: %q err=%v", it.Time, err)
 			continue
 		}
 		if now.Hour() != h || now.Minute() != m {
 			continue
 		}
 		minKey := fmt.Sprintf("%02d:%02d", h, m)
-		if cfg.Timepoint.OncePerDay && s.lastT[dayKey][minKey] {
-			// 每 (dayKey+minKey) 只打一次"已触发"，避免每秒噪音
+		// 去重始终基于 (dayKey+minKey)，无论旧配置的 once_per_day 如何，
+		// 保证每个时间点每天只在命中的那一分钟内触发一次，不会每秒刷屏。
+		if s.lastT[dayKey][minKey] {
 			llKey := dayKey + "|" + minKey
 			if !s.lastLog[llKey] {
 				s.lastLog[llKey] = true
@@ -289,13 +300,19 @@ func (s *ServiceScheduler) tickTimepoints(cfg config.AppConfig, now time.Time, e
 			continue
 		}
 		s.lastT[dayKey][minKey] = true
-		TickDebugf("timepoint FIRE: %s day=%s (cfg.times=%v)", minKey, dayKey, cfg.Timepoint.Times)
-		title := cfg.Timepoint.Title
-		if strings.TrimSpace(title) == "" {
+		TickDebugf("timepoint FIRE: %s day=%s", minKey, dayKey)
+		title := strings.TrimSpace(it.Title)
+		if title == "" {
+			title = strings.TrimSpace(cfg.Timepoint.Title)
+		}
+		if title == "" {
 			title = "温馨提醒"
 		}
-		msg := cfg.Timepoint.Message
-		if strings.TrimSpace(msg) == "" {
+		msg := strings.TrimSpace(it.Message)
+		if msg == "" {
+			msg = strings.TrimSpace(cfg.Timepoint.Message)
+		}
+		if msg == "" {
 			msg = "到点啦，起来走走。"
 		}
 		toFire = append(toFire, PopupEvent{Kind: "timepoint", Title: title, Message: msg, At: now})

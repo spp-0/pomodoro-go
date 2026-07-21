@@ -19,6 +19,7 @@ type AppConfig struct {
     Popup      PopupConfig
     Pomodoro   PomodoroConfig
     Timepoint  TimepointConfig
+    Autostart  bool             `json:"autostart"`   // 是否开机自启（写入 HKCU Run）
 }
 
 type QuoteAPIConfig struct {
@@ -26,13 +27,19 @@ type QuoteAPIConfig struct {
     Timeout string `json:"timeout"`  // Go duration 字符串, 如 "1500ms", "3s"
 }
 
+type SoundConfig struct {
+    Enabled bool   `json:"enabled"`  // 是否播放提醒音
+    File    string `json:"file"`     // 自定义 wav 路径；空=系统默认提示音
+}
+
 type PopupConfig struct {
-    AutoCloseSeconds int    `json:"auto_close_seconds"`
-    Width            int    `json:"width"`
-    Height           int    `json:"height"`
-    ClickThrough     bool   `json:"click_through"`
-    TopMost          bool   `json:"topmost"`
-    Position         string `json:"position"`  // center / top-left / top-right / bottom-left / bottom-right
+    AutoCloseSeconds int         `json:"auto_close_seconds"`
+    Width            int         `json:"width"`
+    Height           int         `json:"height"`
+    ClickThrough     bool        `json:"click_through"` // 预留（当前未实现）
+    TopMost          bool        `json:"topmost"`
+    Position         string      `json:"position"`  // center / top-left / top-right / bottom-left / bottom-right
+    Sound            SoundConfig `json:"sound"`
 }
 
 type PomodoroConfig struct {
@@ -46,13 +53,23 @@ type PomodoroConfig struct {
     BreakText    string `json:"break_text"`
 }
 
-type TimepointConfig struct {
-    Enabled    bool     `json:"enabled"`
-    Times      []string `json:"times"`     // 每个元素 "HH:MM"
-    Title      string   `json:"title"`
-    Message    string   `json:"message"`
-    OncePerDay bool     `json:"once_per_day"`
+type TimepointItem struct {
+    Time    string `json:"time"`    // "HH:MM"
+    Title   string `json:"title"`   // 缺省回落 TimepointConfig.Title
+    Message string `json:"message"` // 缺省回落 TimepointConfig.Message
 }
+
+type TimepointConfig struct {
+    Enabled bool            `json:"enabled"`
+    Times   []TimepointItem `json:"times"`   // 每个元素 {time,title,message}
+    Title   string          `json:"title"`   // 单项未填时的默认标题
+    Message string          `json:"message"` // 单项未填时的默认内容
+}
+```
+
+> **向后兼容**：`Times` 也接受旧版 `[]string`（如 `["10:30","14:30"]`），
+> 解析时自动转成 `[]TimepointItem`；每项只填 `time`，标题/内容回落到根级 `Title/Message`。
+> 每个时间点每天自动只触发一次（去重基于 `dayKey+minKey`），不再有 `once_per_day` 字段。
 ```
 
 ### 1.2 函数
@@ -199,8 +216,8 @@ type ServiceScheduler struct { /* 私有 */ }
 #### `(s *ServiceScheduler) UpdateConfig(cfg config.AppConfig, loc *time.Location)`
 - 替换配置 + 时区
 - 清空当天 `lastT`（已触发时间点标记）
-- 清空番茄钟状态
-- **如果 cfg 中某 timepoint 命中"当前分钟"，立即补一次**（修过"改完配置立即验证"问题）
+- **保留**进行中的番茄钟状态（相位 / nextAt / lastWorkDay）；仅当 `cfg.Pomodoro.Enabled == false` 时才清空番茄钟
+- **如果 cfg 中某 timepoint 命中"当前分钟"，立即补一次**（改完配置立即验证）
 - **线程安全** ✅
 - **调用约束**：不能在持锁状态下调用（废话，正常不会）
 
@@ -287,6 +304,9 @@ type Options struct {
     AutoCloseSeconds int
     TopMost          bool
     Position         string  // center / top-left / top-right / bottom-left / bottom-right
+    Loc             *time.Location // 弹窗时间显示所用时区；nil 回退 time.Local
+    SoundEnabled    bool    // 是否播放提醒音
+    SoundFile       string  // 自定义 wav；空=系统默认提示音
 }
 
 type data struct { /* 私有，渲染到 HTML 用 */ }
@@ -301,9 +321,17 @@ type data struct { /* 私有，渲染到 HTML 用 */ }
   - 倒计时归零 → JS 自动 `closeWindow`
   - 2s 兜底（用户没点、JS 失败时强制 `w.Destroy()`）
 - 返回 `nil` 表示正常关闭
+- 弹窗时间按 `opt.Loc` 显示（`nil` 时 `time.Local`）
+- 若 `opt.SoundEnabled`，弹出时播放提醒音（系统默认提示音或 `opt.SoundFile` 指定 wav）
 - **线程约束**：**必须在 `runtime.LockOSThread()` 锁住的 OS 线程上调用**。否则 webview2 库会失败。
-- **WebView2 失败时**：返回 error，调用方应打日志但不要 panic
+- **WebView2 失败时**：返回 error，调用方应兜底（见 main 包 `startUIDispatcher`）
 - **重复调用**：可以并发调（不同 OS 线程），但要保证每个调用者都 LockOSThread
+
+#### `ShowSettings(configPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, onSaved func(config.AppConfig))`
+- 打开一个 WebView2 设置窗口（非自动关闭），编辑番茄钟 / 时间点（每项独立标题内容）/ 提醒音 / 弹窗位置 / 诗词 API / 开机自启
+- 保存时**原子写盘**（临时文件 + rename）并调用 `sched.UpdateConfig`；`onSaved` 用于配置外副作用（如同步开机自启注册表）
+- 校验失败时在窗口内提示，不关闭
+- **线程约束**：内部已用 `runtime.LockOSThread()` 的独立 goroutine 调用
 
 ### 5.3 HTML 模板 (`pageTemplate`)
 
@@ -349,7 +377,7 @@ main 包**不是公开 API**，但有些"内部约定"新 agent 要知道。
 | 函数 | 行号参考 | 作用 |
 |---|---|---|
 | `main()` | 45-178 | 入口；启动顺序见 [ARCHITECTURE §7](./ARCHITECTURE.md#7-启动流程maingo) |
-| `startUIDispatcher(logger)` | 246-259 | 启动 LockOSThread 的 goroutine 消费 popupQueue |
+| `startUIDispatcher(logger, sched, quoteTimeout)` | — | 启动 LockOSThread 的 goroutine，消费 popupQueue 并在其中异步取诗词 |
 | `applyTrayState(tray, st, paused)` | 181-201 | 切换托盘图标 + tooltip |
 | `buildMenu(tray, cfgPath, sched, logger, paused)` | 210-240 | 构建托盘菜单 |
 | `emitManual(sched)` | 261-281 | 立即弹一次 |
@@ -372,12 +400,12 @@ main 包**不是公开 API**，但有些"内部约定"新 agent 要知道。
 ```go
 m.Add("我的新功能", func() {
     // 注意：这里在 systray 菜单回调线程，**不要直接调 ui.ShowPopup**，
-    // 走 popupQueue
+    // 走 popupQueue。诗词由 dispatcher 异步获取，popupJob 不再带 quote。
     cur := sched.CurrentConfig()
+    loc, _ := cur.Location()
     popupQueue <- popupJob{
         e: scheduler.PopupEvent{Kind: "my_kind", Title: "...", Message: "...", At: time.Now()},
-        q: quote.Fallback(),
-        opts: ui.Options{Width: cur.Popup.Width, Height: cur.Popup.Height, AutoCloseSeconds: 10, TopMost: cur.Popup.TopMost, Position: cur.Popup.Position},
+        opts: ui.Options{Width: cur.Popup.Width, Height: cur.Popup.Height, AutoCloseSeconds: 10, TopMost: cur.Popup.TopMost, Position: cur.Popup.Position, Loc: loc, SoundEnabled: cur.Popup.Sound.Enabled, SoundFile: cur.Popup.Sound.File},
     }
 })
 ```

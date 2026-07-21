@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
-	"time"
 )
 
 // Quote 是一条要展示在弹窗里的语句。
@@ -35,7 +34,7 @@ func Fetch(ctx context.Context, url string) (Quote, error) {
 	}
 	req.Header.Set("User-Agent", "pomodoro-notifier/1.0")
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{} // 超时由传入的 ctx 控制（config.QuoteTimeout）
 	resp, err := client.Do(req)
 	if err != nil {
 		return q, err

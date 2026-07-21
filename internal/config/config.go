@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,21 +26,73 @@ type PomodoroConfig struct {
 	BreakText    string `json:"break_text"`
 }
 
+// TimepointItem 表示单个时间点（可带独立标题与内容）。
+type TimepointItem struct {
+	Time    string `json:"time"`    // "HH:MM"
+	Title   string `json:"title"`   // 缺省回落 TimepointConfig.Title
+	Message string `json:"message"` // 缺省回落 TimepointConfig.Message
+}
+
+// TimepointConfig 指定时间点提醒配置。
+// Times 支持两种 JSON 写法以兼容旧配置：
+//   - 字符串数组：["10:30","14:30"]（共用根级 Title/Message）
+//   - 对象数组：[{"time":"10:30","title":"喝水","message":"去倒杯水"}]
 type TimepointConfig struct {
-	Enabled    bool     `json:"enabled"`
-	Times      []string `json:"times"`
-	Title      string   `json:"title"`
-	Message    string   `json:"message"`
-	OncePerDay bool     `json:"once_per_day"`
+	Enabled bool            `json:"enabled"`
+	Times   []TimepointItem `json:"times"`
+	Title   string          `json:"title"`
+	Message string          `json:"message"`
+}
+
+// UnmarshalJSON 兼容旧版 []string 写法，并统一为 []TimepointItem。
+func (t *TimepointConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Enabled bool            `json:"enabled"`
+		Times   json.RawMessage `json:"times"`
+		Title   string          `json:"title"`
+		Message string          `json:"message"`
+	}
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	t.Enabled = a.Enabled
+	t.Title = a.Title
+	t.Message = a.Message
+	if len(a.Times) == 0 || string(a.Times) == "null" {
+		return nil
+	}
+	// 先尝试新格式 []TimepointItem
+	var items []TimepointItem
+	if err := json.Unmarshal(a.Times, &items); err == nil {
+		t.Times = items
+		return nil
+	}
+	// 回退旧格式 []string
+	var strs []string
+	if err := json.Unmarshal(a.Times, &strs); err != nil {
+		return fmt.Errorf("timepoint.times 格式错误: %w", err)
+	}
+	for _, s := range strs {
+		t.Times = append(t.Times, TimepointItem{Time: s})
+	}
+	return nil
+}
+
+// SoundConfig 控制提醒音。
+type SoundConfig struct {
+	Enabled bool   `json:"enabled"` // 是否播放提醒音
+	File    string `json:"file"`    // 自定义 wav 路径；空=系统默认提示音
 }
 
 type PopupConfig struct {
-	AutoCloseSeconds int    `json:"auto_close_seconds"`
-	Width            int    `json:"width"`
-	Height           int    `json:"height"`
-	ClickThrough     bool   `json:"click_through"`
-	TopMost          bool   `json:"topmost"`
-	Position         string `json:"position"` // center / top-left / top-right / bottom-left / bottom-right
+	AutoCloseSeconds int         `json:"auto_close_seconds"`
+	Width            int         `json:"width"`
+	Height           int         `json:"height"`
+	ClickThrough     bool        `json:"click_through"`
+	TopMost          bool        `json:"topmost"`
+	Position         string      `json:"position"` // center / top-left / top-right / bottom-left / bottom-right
+	Sound            SoundConfig `json:"sound"`
 }
 
 type AppConfig struct {
@@ -49,6 +102,7 @@ type AppConfig struct {
 	Popup     PopupConfig     `json:"popup"`
 	Pomodoro  PomodoroConfig  `json:"pomodoro"`
 	Timepoint TimepointConfig `json:"timepoint"`
+	Autostart bool            `json:"autostart"`
 }
 
 // DefaultConfig 返回默认配置；路径字段需要在调用方按 exe 目录覆盖。
@@ -67,6 +121,7 @@ func DefaultConfig() AppConfig {
 			ClickThrough:     false,
 			TopMost:          true,
 			Position:         "bottom-right",
+			Sound:            SoundConfig{Enabled: true},
 		},
 		Pomodoro: PomodoroConfig{
 			Enabled:      true,
@@ -79,12 +134,16 @@ func DefaultConfig() AppConfig {
 			BreakText:    "休息结束，开始下一个番茄钟。",
 		},
 		Timepoint: TimepointConfig{
-			Enabled:    true,
-			Times:      []string{"10:30", "14:30", "17:30"},
-			Title:      "温馨提醒",
-			Message:    "到点啦，起来走走，喝口水，看看远处。",
-			OncePerDay: true,
+			Enabled: true,
+			Times: []TimepointItem{
+				{Time: "10:30"},
+				{Time: "14:30"},
+				{Time: "17:30"},
+			},
+			Title:   "温馨提醒",
+			Message: "到点啦，起来走走，喝口水，看看远处。",
 		},
+		Autostart: false,
 	}
 }
 

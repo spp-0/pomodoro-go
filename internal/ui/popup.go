@@ -22,6 +22,9 @@ type Options struct {
 	AutoCloseSeconds int
 	TopMost          bool
 	Position         string // center / top-left / top-right / bottom-left / bottom-right
+	Loc             *time.Location // 弹窗时间显示所用时区；nil 时回退 time.Local
+	SoundEnabled    bool           // 是否播放提醒音
+	SoundFile       string         // 自定义 wav 路径；空=系统默认提示音
 }
 
 // data 是渲染到弹窗里的数据。
@@ -47,12 +50,16 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	if opt.AutoCloseSeconds <= 0 {
 		opt.AutoCloseSeconds = 20
 	}
+	tz := opt.Loc
+	if tz == nil {
+		tz = time.Local
+	}
 
 	d := data{
 		Title:     strings.TrimSpace(e.Title),
 		Message:   strings.TrimSpace(e.Message),
 		Kind:      e.Kind,
-		TimeText:  e.At.In(time.Local).Format("2006-01-02 15:04:05"),
+		TimeText:  e.At.In(tz).Format("2006-01-02 15:04:05"),
 		Quote:     q.Text,
 		Author:    q.Author,
 		Source:    q.Source,
@@ -110,6 +117,9 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options) error {
 	})
 
 	w.SetHtml(html)
+	if opt.SoundEnabled {
+		playNotificationSound(opt.SoundFile)
+	}
 	go func() {
 		<-done
 	}()
@@ -421,4 +431,32 @@ func forceForegroundPopup(hwnd uintptr) {
 	fi.uCount = 0
 	fi.dwTimeout = 0
 	procFlash.Call(uintptr(unsafe.Pointer(&fi)))
+}
+
+// playNotificationSound 播放提醒音。
+// file 为空时使用系统默认提示音（MessageBeep）；否则播放指定 wav 文件。
+// 非 Windows 平台为空操作。
+func playNotificationSound(file string) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	const (
+		SND_FILENAME = 0x00020000
+		SND_ASYNC    = 0x0001
+		MB_ICONINFORMATION = 0x00000040
+	)
+	user32 := syscall.NewLazyDLL("user32.dll")
+	procMessageBeep := user32.NewProc("MessageBeep")
+	if strings.TrimSpace(file) == "" {
+		procMessageBeep.Call(uintptr(MB_ICONINFORMATION))
+		return
+	}
+	mm := syscall.NewLazyDLL("winmm.dll")
+	procPlaySound := mm.NewProc("PlaySoundW")
+	p, err := syscall.UTF16PtrFromString(file)
+	if err != nil {
+		procMessageBeep.Call(uintptr(MB_ICONINFORMATION))
+		return
+	}
+	procPlaySound.Call(uintptr(unsafe.Pointer(p)), 0, SND_FILENAME|SND_ASYNC)
 }

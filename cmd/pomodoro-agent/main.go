@@ -33,7 +33,6 @@ var trayPausePNG []byte
 // popupJob 是 UI dispatcher 消费的任务。
 type popupJob struct {
 	e    scheduler.PopupEvent
-	q    quote.Quote
 	opts ui.Options
 }
 
@@ -41,6 +40,9 @@ type popupJob struct {
 // UI dispatcher 在它启动的 goroutine（与主托盘消息循环同一个 goroutine）
 // 同步调用 ui.ShowPopup，绕过 webview2 库对"调用者线程"的隐式要求。
 var popupQueue = make(chan popupJob, 16)
+
+// webviewWarned 保证“弹窗渲染失败”只提示一次，避免消息框刷屏。
+var webviewWarned atomic.Bool
 
 func main() {
 	var (
@@ -65,12 +67,21 @@ func main() {
 				fail("save default config: %v", saveErr)
 			}
 		} else {
-			fail("load config: %v", err)
+			// 配置解析失败：降级为默认配置 + 弹窗提示，但不退出，
+			// 保证工具始终能启动（提醒类工具“起不来”比“弹错”更糟）。
+			showInfo("配置有误", "配置文件存在错误，已使用默认配置。\n请检查: "+path+"\n\n"+err.Error())
+			cfg = config.DefaultConfig()
+			cfg.LogFile = "pomodoro.log"
 		}
 	}
 	cfg.LogFile = filepath.Join(filepath.Dir(path), filepath.Base(cfg.LogFile))
 	logger := logging.New(cfg.LogFile)
 	logger.Printf("start config=%s", path)
+
+	// 启动时按配置同步开机自启注册表项（幂等）。
+	if err := setAutostart(cfg.Autostart); err != nil {
+		logger.Printf("setAutostart: %v", err)
+	}
 
 	// 2) 测试模式
 	if testMode {
@@ -87,6 +98,8 @@ func main() {
 			AutoCloseSeconds: cfg.Popup.AutoCloseSeconds,
 			TopMost:          cfg.Popup.TopMost,
 			Position:         cfg.Popup.Position,
+			SoundEnabled:     cfg.Popup.Sound.Enabled,
+			SoundFile:        cfg.Popup.Sound.File,
 		})
 		return
 	}
@@ -115,20 +128,23 @@ func main() {
 		}
 		// 关键：每次触发都从 sched 取最新 cfg，确保热重载生效
 		cur := sched.CurrentConfig()
+		loc, _ := cur.Location()
 		logger.Printf("[emit] popup: pos=%s size=%dx%d autoclose=%ds", cur.Popup.Position, cur.Popup.Width, cur.Popup.Height, cur.Popup.AutoCloseSeconds)
-		q := fetchQuote(cur, quoteTimeout, logger)
-		logger.Printf("[emit] quote: %q", q.Text)
 		// 把弹窗任务投递到 UI dispatcher 队列。
 		// UI dispatcher 是个独立的"锁定 OS 线程"的 goroutine，保证 webview2 库的
 		// 内部 goroutine 与 ShowPopup 在同一个 OS 线程，避开主线程消息循环的
-		// 隐式要求。emit 自身不阻塞调度 tick。
+		// 隐式要求。emit 自身不阻塞调度 tick；诗词在 dispatcher 里异步取，
+		// 因此即使断网/慢网，调度 tick 也不会被卡住。
 		select {
-		case popupQueue <- popupJob{e: e, q: q, opts: ui.Options{
+		case popupQueue <- popupJob{e: e, opts: ui.Options{
 			Width:            cur.Popup.Width,
 			Height:           cur.Popup.Height,
 			AutoCloseSeconds: cur.Popup.AutoCloseSeconds,
 			TopMost:          cur.Popup.TopMost,
 			Position:         cur.Popup.Position,
+			Loc:              loc,
+			SoundEnabled:     cur.Popup.Sound.Enabled,
+			SoundFile:        cur.Popup.Sound.File,
 		}}:
 			logger.Printf("[emit] enqueued to UI dispatcher")
 		default:
@@ -142,7 +158,7 @@ func main() {
 
 	// UI dispatcher：锁定 OS 线程，按顺序消费弹窗任务。
 	// webview2 库的 Run() 必须阻塞在同一个 OS 线程。
-	startUIDispatcher(logger)
+	startUIDispatcher(logger, sched, quoteTimeout)
 
 	// 调度主循环
 	go func() {
@@ -210,6 +226,7 @@ func resolveConfigPath(flagPath string) (string, error) {
 func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool) *systray.Menu {
 	m := systray.NewMenu()
 	m.Add("立即弹一次", func() { emitManual(sched) })
+	m.Add("设置…", func() { openSettings(cfgPath, sched, logger) })
 	m.AddSeparator()
 	m.AddCheckbox("暂停调度（点击切换）", false, func() {
 		if paused.Load() {
@@ -223,6 +240,38 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 			logger.Printf("paused")
 			applyTrayState(tray, scheduler.StateIdle, paused)
 		}
+	})
+	m.AddCheckbox("声音", sched.CurrentConfig().Popup.Sound.Enabled, func() {
+		cur := sched.CurrentConfig()
+		enabled := !cur.Popup.Sound.Enabled
+		if c, err := config.Load(cfgPath); err == nil {
+			c.Popup.Sound.Enabled = enabled
+			if err := config.Save(cfgPath, c); err != nil {
+				showInfo("声音", "保存失败: "+err.Error())
+				return
+			}
+			loc, _ := c.Location()
+			sched.UpdateConfig(c, loc)
+			logger.Printf("sound enabled=%v", enabled)
+		}
+	})
+	m.AddCheckbox("开机自启", sched.CurrentConfig().Autostart, func() {
+		cur := sched.CurrentConfig()
+		enabled := !cur.Autostart
+		if err := setAutostart(enabled); err != nil {
+			showInfo("开机自启", "设置失败: "+err.Error())
+			return
+		}
+		if c, err := config.Load(cfgPath); err == nil {
+			c.Autostart = enabled
+			if err := config.Save(cfgPath, c); err != nil {
+				showInfo("开机自启", "保存失败: "+err.Error())
+				return
+			}
+			loc, _ := c.Location()
+			sched.UpdateConfig(c, loc)
+		}
+		logger.Printf("autostart=%v", enabled)
 	})
 	m.Add("重新加载配置", func() {
 		if err := reloadConfig(cfgPath, sched, logger); err != nil {
@@ -239,18 +288,36 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 	return m
 }
 
+// openSettings 打开设置窗口；保存成功后通过 onSaved 做附带副作用（如同步开机自启）。
+func openSettings(cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger) {
+	ui.ShowSettings(cfgPath, sched, logger, func(cfg config.AppConfig) {
+		if err := setAutostart(cfg.Autostart); err != nil {
+			showInfo("开机自启", "设置失败: "+err.Error())
+		}
+	})
+}
+
 // startUIDispatcher 在独立 goroutine 锁定 OS 线程，按顺序消费 popupQueue。
 // webview2 库的 NewWithOptions/Run 强烈依赖"调用者线程有消息循环 + 在同一 OS 线程"。
 // 在这里我们锁定 OS 线程后，库内部 goroutine 会自动绑定到同一线程，避开主线程
 // 已被 systray.Run 占用的冲突。
-func startUIDispatcher(logger *logging.Logger) {
+func startUIDispatcher(logger *logging.Logger, sched *scheduler.ServiceScheduler, quoteTimeout time.Duration) {
 	go func() {
 		runtime.LockOSThread()
 		for job := range popupQueue {
 			logger.Printf("[ui] ShowPopup begin kind=%s", job.e.Kind)
-			err := ui.ShowPopup(job.e, job.q, job.opts)
+			// 诗词在 dispatcher 协程里取，不阻塞调度 tick 协程。
+			q := fetchQuote(sched.CurrentConfig(), quoteTimeout, logger)
+			logger.Printf("[ui] quote: %q", q.Text)
+			err := ui.ShowPopup(job.e, q, job.opts)
 			if err != nil {
 				logger.Printf("[ui] ShowPopup failed: %v", err)
+				// 兜底：弹窗渲染失败时，用系统消息框展示提醒内容，
+				// 避免提醒静默丢失；仅首次失败时提示，避免消息框刷屏。
+				if webviewWarned.CompareAndSwap(false, true) {
+					showInfo(job.e.Title, job.e.Message)
+					showInfo("提醒组件异常", "弹窗渲染失败，已用系统消息框兜底提醒。\n可能缺少 WebView2 Runtime，请安装后重启。")
+				}
 			} else {
 				logger.Printf("[ui] ShowPopup OK")
 			}
@@ -261,22 +328,32 @@ func startUIDispatcher(logger *logging.Logger) {
 func emitManual(sched *scheduler.ServiceScheduler) {
 	e := scheduler.PopupEvent{
 		Kind:    "manual",
-		Title:   "手动测试",
-		Message: "这是你点击托盘触发的测试提醒。",
+		Title:   "手动提醒",
+		Message: "这是你点击托盘触发的提醒。",
 		At:      time.Now(),
 	}
 	cur := sched.CurrentConfig()
-	// 同样走 UI dispatcher，避免 systray 菜单回调线程触发 webview2 异常
-	popupQueue <- popupJob{
+	loc, _ := cur.Location()
+	// 同样走 UI dispatcher，避免 systray 菜单回调线程触发 webview2 异常。
+	// 非阻塞发送：队列满时丢弃（极少发生），不会冻结托盘菜单。
+	job := popupJob{
 		e: e,
-		q: quote.Fallback(),
 		opts: ui.Options{
 			Width:            cur.Popup.Width,
 			Height:           cur.Popup.Height,
-			AutoCloseSeconds: 15,
+			AutoCloseSeconds: cur.Popup.AutoCloseSeconds,
 			TopMost:          cur.Popup.TopMost,
 			Position:         cur.Popup.Position,
+			Loc:              loc,
+			SoundEnabled:     cur.Popup.Sound.Enabled,
+			SoundFile:        cur.Popup.Sound.File,
 		},
+	}
+	select {
+	case popupQueue <- job:
+		// enqueued
+	default:
+		// 队列满，丢弃
 	}
 }
 

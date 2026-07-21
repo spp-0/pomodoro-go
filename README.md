@@ -31,14 +31,20 @@
 
 ### 3.2 托盘菜单
 - **左键单击托盘** / **立即弹一次**：手动弹一个提醒
+- **设置…**：打开图形化设置窗口（番茄钟、时间点、提醒音、弹窗位置、诗词 API、开机自启）
 - **暂停调度**（点选切换）：所有提醒暂停；再次点击恢复
+- **声音**（点选切换）：弹窗时是否播放提醒音
+- **开机自启**（点选切换）：登录时自动启动
 - **重新加载配置**：编辑 `config.json` 后立即生效
 - **打开配置目录**：在资源管理器中打开 exe 所在目录
 - **关于**：版本与快捷键说明
 - **退出**
 
 ### 3.3 改提醒时间
-编辑 `config.json`（exe 同目录），保存后等 2 秒自动重载；或右键托盘 → 重新加载配置。
+最方便：右键托盘 → **设置…** 打开设置窗口直接改（自动保存并热重载）。
+
+也可以手动编辑 `config.json`（exe 同目录），保存后等 2 秒自动重载；或右键托盘 → 重新加载配置。
+每个时间点可单独配标题/内容：
 
 ```json
 {
@@ -54,37 +60,43 @@
   },
   "timepoint": {
     "enabled": true,
-    "times": ["10:30", "14:30", "17:30"],
+    "times": [
+      { "time": "10:30" },
+      { "time": "14:30", "title": "喝口水", "message": "起来倒杯水，远眺一会。" },
+      { "time": "17:30" }
+    ],
     "title":   "温馨提醒",
-    "message": "到点啦，起来走走，喝口水，看看远处。",
-    "once_per_day": true
+    "message": "到点啦，起来走走，喝口水，看看远处。"
   },
   "popup": {
     "auto_close_seconds": 20,
     "width":  560,
     "height": 340,
     "topmost": true,
-    "position": "bottom-right"
-  }
+    "position": "bottom-right",
+    "sound": { "enabled": true, "file": "" }
+  },
+  "autostart": false
 }
 ```
 
 > 完整配置说明在 [DEVELOPING.md §3.1](./DEVELOPING.md)
 
 ### 3.4 开机自启
-把 `PomodoroNotifier.exe` 的快捷方式放到 `shell:startup`（Win+R → `shell:startup` → 回车）。
+右键托盘 → **开机自启**（点选切换）即可，会自动写入注册表 `HKCU\...\Run`。
 
+也可手动：把 `PomodoroNotifier.exe` 的快捷方式放到 `shell:startup`（Win+R → `shell:startup` → 回车）；
 更稳的方式：任务计划程序 → 创建任务 → 触发器"用户登录时" → 操作"启动程序" → 勾选"使用最高权限"。
 
 ## 4. 编译（开发者）
 
 ```powershell
-cd c:\Users\Administrator\scripts\pomodoro-go
+cd <项目目录>\pomodoro-go
 go mod tidy
 go build -ldflags "-H windowsgui -s -w" -o .\dist\PomodoroNotifier.exe .\cmd\pomodoro-agent
 ```
 
-产物：`dist\PomodoroNotifier.exe`（~10MB）
+产物：`dist\PomodoroNotifier.exe`（~10MB，已用 `-s -w` 去符号表）
 
 ## 5. 常见问题
 
@@ -120,7 +132,7 @@ pomodoro-go/
 
 ## 7. 技术栈
 
-- Go 1.25+
+- Go 1.26+
 - [gogpu/systray](https://github.com/gogpu/systray) — 系统托盘（零 CGO）
 - [Krakinsight/go-webview2](https://github.com/Krakinsight/go-webview2) — WebView2 绑定
 - v1.hitokoto.cn — 在线诗词/名言 API

@@ -13,11 +13,11 @@
 
 ## 1. 环境
 
-- Go 1.25+（无 CGO，但依赖用 `go install` / `go get`）
+- Go 1.26+（无 CGO，但依赖用 `go install` / `go get`）
 - Windows 10+（WebView2 Runtime 预装）
 - 工具链：`go build`, `go run`, `go mod tidy`
 
-> 验证：进入 `c:\Users\Administrator\scripts\pomodoro-go` 跑 `go version`，输出应 ≥ `go1.25`。
+> 验证：进入项目目录 `pomodoro-go` 跑 `go version`，输出应 ≥ `go1.26`。
 
 ---
 
@@ -25,7 +25,7 @@
 
 ```powershell
 # 1) 拉依赖（首次 / 改了 go.mod）
-cd c:\Users\Administrator\scripts\pomodoro-go
+cd <项目目录>\pomodoro-go
 go mod tidy
 
 # 2) 全量编译检查（不会生成 exe）
@@ -53,21 +53,25 @@ go run .\cmd\gentray
 
 ### 3.1 加新配置字段
 
-场景：比如要加"提醒音开关" `sound_enabled`。
+场景：比如要加"提醒音开关"。
 
 **步骤**：
 
 1. **改 `internal/config/config.go`**：
    ```go
+   type SoundConfig struct {
+       Enabled bool   `json:"enabled"`
+       File    string `json:"file"` // 自定义 wav；空=系统默认提示音
+   }
    type PopupConfig struct {
        // ... 已有字段
-       SoundEnabled bool `json:"sound_enabled"`
+       Sound SoundConfig `json:"sound"`
    }
    ```
 
 2. **在 `DefaultConfig()` 补默认值**：
    ```go
-   SoundEnabled: true,
+   Sound: SoundConfig{Enabled: true},
    ```
 
 3. **在 `ApplyDefaults()` 补兜底**（可选，按需）：
@@ -78,14 +82,14 @@ go run .\cmd\gentray
 4. **使用方**（如 `internal/ui/popup.go` 或 main）：
    ```go
    cur := sched.CurrentConfig()
-   if cur.Popup.SoundEnabled {
+   if cur.Popup.Sound.Enabled {
        // 播放声音
    }
    ```
 
 5. **测试**：删 `dist\config.json`，重新运行让程序生成新 schema。
 
-**注意**：JSON 字段名用 snake_case (`sound_enabled`)，Go 字段名用 PascalCase (`SoundEnabled`)。
+**注意**：JSON 字段名用 snake_case (`enabled`)，Go 字段名用 PascalCase (`Enabled`)。嵌套对象用独立 struct（如 `SoundConfig`）。
 
 ---
 
@@ -386,13 +390,16 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 6. 跑 `-test` 验证弹窗
 7. 正常运行 5 分钟，验证：
    - 托盘图标显示
-   - 立即弹一次菜单
+   - 立即弹一次菜单（有提醒音、标题为"手动提醒"）
+   - 设置… 窗口可打开并保存
+   - 声音 / 开机自启 复选框可切换
    - 暂停/恢复菜单
    - 重新加载配置菜单
    - 打开配置目录菜单
    - 退出菜单
-8. 改 `dist\config.json` 触发 reload，验证配置生效
-9. 把 `dist\PomodoroNotifier.exe` 单独拷给用户
+8. 改 `dist\config.json` 触发 reload，验证配置生效（且进行中的番茄钟不被重置）
+9. 故意把 `config.json` 写错一个字符，确认程序弹窗提示并以默认配置启动（不崩溃退出）
+10. 把 `dist\PomodoroNotifier.exe` 单独拷给用户
    - 用户的 `config.json` / `pomodoro.log` 不要覆盖
 
 ---

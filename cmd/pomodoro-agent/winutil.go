@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
 	"syscall"
@@ -60,4 +61,58 @@ func utf16Ptr(s string) *uint16 {
 		return nil
 	}
 	return p
+}
+
+// setAutostart 通过 HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+// 设置/取消开机自启（不引入额外依赖，直接用 advapi32 的注册表 API）。
+func setAutostart(enabled bool) error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	const (
+		HKEY_CURRENT_USER = 0x80000001
+		KEY_SET_VALUE     = 0x0002
+		REG_SZ            = 1
+	)
+	adv := syscall.NewLazyDLL("advapi32.dll")
+	procOpen := adv.NewProc("RegOpenKeyExW")
+	procSet := adv.NewProc("RegSetValueExW")
+	procDel := adv.NewProc("RegDeleteValueW")
+	procClose := adv.NewProc("RegCloseKey")
+
+	keyPath := `Software\Microsoft\Windows\CurrentVersion\Run`
+	pPath, err := syscall.UTF16PtrFromString(keyPath)
+	if err != nil {
+		return err
+	}
+	var hkey syscall.Handle
+	r, _, _ := procOpen.Call(HKEY_CURRENT_USER, uintptr(unsafe.Pointer(pPath)), 0, KEY_SET_VALUE, uintptr(unsafe.Pointer(&hkey)))
+	if r != 0 {
+		return fmt.Errorf("RegOpenKeyEx failed: %d", r)
+	}
+	defer procClose.Call(uintptr(hkey))
+
+	appName := "PomodoroNotifier"
+	pName, err := syscall.UTF16PtrFromString(appName)
+	if err != nil {
+		return err
+	}
+	if enabled {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		val, err := syscall.UTF16PtrFromString(exe)
+		if err != nil {
+			return err
+		}
+		// REG_SZ: (hkey, name, reserved=0, type, data, datasize in bytes incl. null terminator)
+		r, _, _ = procSet.Call(uintptr(hkey), uintptr(unsafe.Pointer(pName)), 0, REG_SZ, uintptr(unsafe.Pointer(val)), uintptr((len(exe)+1)*2))
+		if r != 0 {
+			return fmt.Errorf("RegSetValueEx failed: %d", r)
+		}
+	} else {
+		procDel.Call(uintptr(hkey), uintptr(unsafe.Pointer(pName)))
+	}
+	return nil
 }
