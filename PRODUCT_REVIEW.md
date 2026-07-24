@@ -35,7 +35,9 @@
 ### 1.2 【严重 Bug】配置文件 JSON 写错一个字符，工具直接退出的
 - **位置**：`cmd/pomodoro-agent/main.go` 第 60–70 行
 - **现象**：`config.Load` 除"文件不存在"外，任何解析错误都走 `fail()` → `os.Exit(1)`。普通用户改 `config.json` 多一个逗号，托盘常驻程序直接起不来，且只弹一个原始错误框。
-- **建议**：解析失败时**降级为默认配置 + 弹窗告警**，保证工具永远能启动；同时把出错字段位置提示给用户（用 `json.SyntaxError` 的行号）。
+  - **建议**：解析失败时**降级为默认配置 + 弹窗告警**，保证工具永远能启动；同时把出错字段位置提示给用户（用 `json.SyntaxError` 的行号）。
+
+> ✅ **已修复（2026-07-24，M1）**：`main.go` 配置加载失败时降级为默认配置并调用 `showInfo` 弹窗提示，不再 `os.Exit`。
 
 ### 1.3 【严重可靠性】WebView2 不可用 / 失败时，提醒静默丢失
 - **位置**：`cmd/pomodoro-agent/main.go` `startUIDispatcher()`（第 251–256 行）；`internal/ui/popup.go` `ShowPopup` 返回 error
