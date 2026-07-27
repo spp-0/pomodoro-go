@@ -157,6 +157,7 @@ pomodoro-go/
 - **重构**：弹窗防卡死架构——每个弹窗独立 OS 线程 + Go 侧自动关闭定时器 + 看门狗兜底 + WebView2 失败回退系统消息框
 - **新增**：切换显示语言后托盘右键菜单即时重建（vendored systray 新增 `RebuildMenu` 补丁）
 - **修复**：设置页模板残留 `{{.Lang}}` 字面量
+- **下载**：[PomodoroNotifier.exe（Windows GUI，无控制台）](https://github.com/spp-0/pomodoro-go/releases/download/v1.1.0/PomodoroNotifier.exe)
 
 ### v1.0.0
 - 首个发布版本：番茄钟 + 时间点提醒 + 托盘 + WebView2 弹窗 + 诗词/天气 + 统计 + 多语言
