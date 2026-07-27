@@ -46,6 +46,11 @@ var popupQueue = make(chan popupJob, 16)
 // webviewWarned 保证“弹窗渲染失败”只提示一次，避免消息框刷屏。
 var webviewWarned atomic.Bool
 
+// trayLang 记录当前托盘菜单（右击菜单）渲染所用的语言，用于判断语言是否变化、
+// 从而决定是否重建菜单。配置热重载后语言可能变化，但托盘菜单在启动时只构建一次，
+// 故需据此对比并主动重建。
+var trayLang string
+
 func main() {
 	var (
 		configPath  string
@@ -60,7 +65,6 @@ func main() {
 	if err != nil {
 		fail("resolve config: %v", err)
 	}
-	var lang i18n.Lang
 	cfg, err := config.Load(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -72,13 +76,12 @@ func main() {
 		} else {
 			// 配置解析失败：降级为默认配置 + 弹窗提示，但不退出，
 			// 保证工具始终能启动（提醒类工具“起不来”比“弹错”更糟）。
-			showInfo(i18n.T(lang, "cfgerror.title"), i18n.T(lang, "cfgerror.msg")+path+"\n\n"+err.Error())
+			showInfo(i18n.T(i18n.Lang(""), "cfgerror.title"), i18n.T(i18n.Lang(""), "cfgerror.msg")+path+"\n\n"+err.Error())
 			cfg = config.DefaultConfig()
 			cfg.LogFile = "pomodoro.log"
 		}
 	}
 	cfg.LogFile = filepath.Join(filepath.Dir(path), filepath.Base(cfg.LogFile))
-	lang = i18n.Lang(cfg.Language) // 整个进程生命周期内的界面语言（设置变更会热重载配置，但托盘菜单/提示在启动时构建一次）
 	logger := logging.New(cfg.LogFile)
 	logger.Printf("start config=%s", path)
 
@@ -174,38 +177,50 @@ func main() {
 	}
 	sched.SetEmitter(emit)
 
-	// 配置热重载
-	go watchConfig(path, sched, logger)
-
 	// UI dispatcher：锁定 OS 线程，按顺序消费弹窗任务。
 	// webview2 库的 Run() 必须阻塞在同一个 OS 线程。
 	startUIDispatcher(logger, sched, quoteTimeout)
 
 	// 启动托盘消息循环（阻塞直到退出）
 	tray := systray.New()
+	lang := i18n.Lang(sched.CurrentConfig().Language)
+	trayLang = string(lang)
 	applyTrayState(tray, scheduler.StateIdle, &paused, lang)
 	tray.SetTooltip(i18n.T(lang, "tray.toolip.normal"))
-	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store, lang)
+	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store)
 	tray.SetMenu(menu)
 
-	// 注册 scheduler 状态切换 → 切托盘图标
+	// 语言变化 / 外部改配置时重建托盘菜单（菜单只在启动时构建一次，需主动重建）。
+	rebuildMenuIfLangChanged := func() {
+		cur := sched.CurrentConfig().Language
+		if cur == trayLang {
+			return
+		}
+		trayLang = cur
+		tray.SetMenu(buildMenu(tray, path, sched, logger, &paused, &dnd, store))
+	}
+
+	// 注册 scheduler 状态切换 → 切托盘图标（始终按当前语言渲染）
 	sched.SetStateListener(func(st scheduler.State) {
 		display := st
 		if paused.Load() {
 			display = scheduler.StateIdle
 		}
-		applyTrayState(tray, display, &paused, lang)
+		applyTrayState(tray, display, &paused, i18n.Lang(sched.CurrentConfig().Language))
 	})
 
 	// 调度主循环：每秒推进调度，并刷新托盘 tooltip（相位剩余 + 今日番茄数）。
-		go func() {
+	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			sched.Tick(now)
-			updateTrayTooltip(tray, sched, store, &dnd, lang, now)
+			updateTrayTooltip(tray, sched, store, &dnd, i18n.Lang(sched.CurrentConfig().Language), now)
 		}
 	}()
+
+	// 配置热重载监听：文件变化 → 重新载入配置 → 必要时重建菜单。
+	go watchConfig(path, sched, logger, rebuildMenuIfLangChanged)
 
 	tray.OnClick(func() { emitManual(sched) })
 	tray.Show()
@@ -265,10 +280,11 @@ func resolveConfigPath(flagPath string) (string, error) {
 	return config.DefaultConfigPath()
 }
 
-func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store, lang i18n.Lang) *systray.Menu {
+func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) *systray.Menu {
+	lang := i18n.Lang(sched.CurrentConfig().Language)
 	m := systray.NewMenu()
 	m.Add(i18n.T(lang, "tray.menu.popup"), func() { emitManual(sched) })
-	m.Add(i18n.T(lang, "tray.menu.settings"), func() { openSettings(cfgPath, sched, logger, store) })
+	m.Add(i18n.T(lang, "tray.menu.settings"), func() { openSettings(tray, cfgPath, sched, logger, paused, dnd, store) })
 	m.AddSeparator()
 	m.AddCheckbox(i18n.T(lang, "tray.menu.pause"), false, func() {
 		if paused.Load() {
@@ -355,10 +371,15 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 }
 
 // openSettings 打开设置窗口；保存成功后通过 onSaved 做附带副作用（如同步开机自启）。
-func openSettings(cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, store *stats.Store) {
+// 若语言变化，立即重建托盘菜单，使右击菜单即时本地化（配置已在 applySettings 内热重载到 sched）。
+func openSettings(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) {
 	ui.ShowSettings(cfgPath, sched, logger, func(cfg config.AppConfig) {
 		if err := setAutostart(cfg.Autostart); err != nil {
 			showInfo("开机自启", "设置失败: "+err.Error())
+		}
+		if cfg.Language != trayLang {
+			trayLang = cfg.Language
+			tray.SetMenu(buildMenu(tray, cfgPath, sched, logger, paused, dnd, store))
 		}
 	}, store)
 }
@@ -443,7 +464,7 @@ func reloadConfig(path string, sched *scheduler.ServiceScheduler, logger *loggin
 	return nil
 }
 
-func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging.Logger) {
+func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging.Logger, onLangChange func()) {
 	last, _ := os.Stat(path)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -456,6 +477,8 @@ func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging
 			last = stat
 			if err := reloadConfig(path, sched, logger); err != nil {
 				logger.Printf("reload failed: %v", err)
+			} else if onLangChange != nil {
+				onLangChange()
 			}
 		}
 	}
