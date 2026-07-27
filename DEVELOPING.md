@@ -252,6 +252,34 @@ func buildMenu(...) *systray.Menu {
 
 ---
 
+### 3.7 加新语言 / 加新文案
+
+本项目用 `internal/i18n` 做界面多语言（只翻译 UI 外壳，不翻译用户配置的提醒文案 / 诗词）。
+
+**加一门新语言**（如法语 `fr`）：
+
+1. **改 `internal/i18n/i18n.go`**：
+   - 在 `Lang` 常量块加 `Fr Lang = "fr"`
+   - 在 `supported` 切片加 `Fr`
+   - 复制 `ZhCN` 整块 map，新增 `Fr: { ... }`，逐 key 翻译（至少补齐所有 key，缺失会回落 zh-CN）
+   - 在 `Name()` 的 `switch` 加 `case Fr: return "Français"`
+
+2. **验证**：`norm` 已自动把未知语言回落 zh-CN，无需改其它调用点。
+
+**加一个新 UI 文案 key**（所有语言都要有）：
+
+1. 在 `dict` 每个语言里加同一 key（如 `"popup.new_button": "..."`）。
+2. 调用点用 `i18n.T(i18n.Lang(cfg.Language), "popup.new_button")` 取文案；
+   带 `%d` 等占位时：
+   ```go
+   msg := fmt.Sprintf(i18n.T(lang, "pomodoro.work_prefix"), work, brk)
+   ```
+3. 设置面板 JS 用注入的 `I18N` + `t(key)` 查表，无需新增 HTML 模板。
+
+⚠️ **`T` 不是 printf**：签名是 `T(lang, key)` 纯查表，`go vet` 会对"有参数却无格式化指令"告警；务必用 `fmt.Sprintf` 包裹。
+
+---
+
 ## 4. 调试技巧
 
 ### 4.1 看实时日志
@@ -428,7 +456,8 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 | 改弹窗样式 | `internal/ui/popup.go` | `pageTemplate` |
 | 改弹窗位置算法 | `internal/ui/popup.go` | `computeLocation` |
 | 加新托盘菜单 | `cmd/pomodoro-agent/main.go` | `buildMenu` |
-| 改天气数据源 | `internal/weather/weather.go` | `Fetch` / `describe` |
+| 改天气数据源 | `internal/weather/weather.go` | `Fetch(ctx, city, lang)` / `i18n.WeatherText` |
+| 改多语言/文案 | `internal/i18n/i18n.go` | `T` / `Dict` / `Supported` / `WeatherText` |
 | 改统计存储 | `internal/stats/stats.go` | `RecordPomodoro` / `Today` / `Last7` |
 | 改稍后提醒/跳过/延长 | `internal/scheduler/scheduler.go` | `Snooze` / `SkipBreak` / `ExtendBreak` / `PomodoroStatus` |
 | 改托盘图标 | `cmd/gentray/main.go` | `themes` 字典 |

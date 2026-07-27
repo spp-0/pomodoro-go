@@ -1,6 +1,10 @@
 package weather
 
-import "testing"
+import (
+	"testing"
+
+	"pomodoro-notifier/internal/i18n"
+)
 
 func TestDescribe(t *testing.T) {
 	cases := []struct {
@@ -14,7 +18,7 @@ func TestDescribe(t *testing.T) {
 		{999, "未知"},
 	}
 	for _, c := range cases {
-		emoji, text := describe(c.code)
+		emoji, text := i18n.WeatherText(i18n.ZhCN, c.code)
 		if text != c.want {
 			t.Fatalf("code %d 期望文案 %q，实际 %q", c.code, c.want, text)
 		}

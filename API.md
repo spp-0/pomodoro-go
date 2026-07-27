@@ -15,6 +15,7 @@
 type AppConfig struct {
     LogFile    string           `json:"log_file"`
     TimeZone   string           `json:"timezone"`
+    Language   string           `json:"language"`    // 界面显示语言；见 §9 internal/i18n。缺省回落 zh-CN
     QuoteAPI   QuoteAPIConfig
     Popup      PopupConfig
     Pomodoro   PomodoroConfig
@@ -81,7 +82,7 @@ type TimepointConfig struct {
 ### 1.2 函数
 
 #### `DefaultConfig() AppConfig`
-- 完整默认值
+- 完整默认值（界面语言固定为 `zh-CN`）
 - 不读文件；纯函数
 - **用途**：首次启动生成 `config.json` 时调用
 
@@ -89,6 +90,8 @@ type TimepointConfig struct {
 - 读 JSON
 - 找不到文件 → 返回 `os.IsNotExist` 错误，**由 main 包决定要不要 `DefaultConfig + Save`**
 - 读取后自动 `ApplyDefaults`（补全缺失字段）
+- **语言跟随文件**：先读 JSON 顶层 `language` 字段，再以此为基准补全其余缺省值，
+  因此旧配置缺字段时也会以「文件自带语言」而非 zh-CN 来本地化（见 §9）。
 - **错误**：JSON 解析错误 / 文件权限错误
 
 #### `Save(path string, cfg AppConfig) error`
@@ -98,7 +101,7 @@ type TimepointConfig struct {
 - **用途**：写默认配置、热重载时持久化
 
 #### `(c *AppConfig) ApplyDefaults()`
-- 补齐缺省值（`Position` 归一化、Timeout 兜底、Pomodoro 缺省工作日 1-5 等）
+- 补齐缺省值（`Position` 归一化、Timeout 兜底、Pomodoro 缺省工作日 1-5 等；`Language` 归一化为受支持语言，未知值回落 `zh-CN`）
 - **注意**：会修改入参（指针接收）
 
 #### `ExeDir() (string, error)` / `DefaultConfigPath() (string, error)`
@@ -336,6 +339,7 @@ type Options struct {
     OnSnooze        func(minutes int) // 非 nil 时显示「稍后提醒」按钮（5/10/15 分）
     WeatherEnabled  bool    // 是否在弹窗内显示天气
     WeatherCity     string  // 天气城市
+    Lang            string  // 弹窗 UI 语言代码（如 "zh-CN"）；空=跟随配置 lang
 }
 
 type data struct { /* 私有，渲染到 HTML 用 */ }
@@ -455,13 +459,14 @@ m.Add("我的新功能", func() {
 ```go
 // Fetch 获取城市当前天气：先查内置中文城市坐标表，未命中再走 Open-Meteo 地理编码；最后取 current_weather。
 // 任何一步失败返回 error，调用方应静默忽略（弹窗照常显示，只是天气块显示“天气获取失败”）。
-func Fetch(ctx context.Context, city string) (Weather, error)
+// lang 决定天气文案语言（见 §9 internal/i18n），空字符串回落 zh-CN。
+func Fetch(ctx context.Context, city string, lang string) (Weather, error)
 
 func TempString(t float64) string // "26°C"（四舍五入到整数度）
 ```
 
-- `Weather` 结构：`City / Temperature / Code(WMO) / Text(中文文案) / Emoji`
-- 内部 `describe(code)` 把 WMO weather code 映射为 emoji + 中文文案
+- `Weather` 结构：`City / Temperature / Code(WMO) / Text(语言化文案) / Emoji`
+- 文案由 `i18n.WeatherText(lang, code)` 按 WMO code 分组映射 emoji + 语言化文案（不再有仓库内 `describe()`）
 - **内置 `cityCoordinates` 表**：覆盖北京、上海、广州、深圳、杭州等 40+ 个常见城市，支持中文名和拼音/英文别名；解决 Open-Meteo geocoding 对部分中文城市返回 `city not found` 的问题。
 - **HTTP 客户端强制优先 IPv4 + HTTP/1.1**（避免部分网络下 IPv6/HTTP/2 握手挂起），每个请求 5s 客户端超时，并对网络/超时错误**重试一次**；`Fetch` 自身在调用方 ctx 之上再叠加 12s 总超时。
 - 调用方（`ui.ShowPopup`）**异步**获取天气：弹窗先立即显示，天气就绪后通过 `renderWeather(json)` 注入 DOM，失败不阻断提醒、并写入日志（`[weather] fetch failed: ...`）。
@@ -482,4 +487,47 @@ func (s *Store) Last7() []DayStat             // 最近 7 天（正序）
 - `DayStat{ Pomodoros int; Timepoints int }`
 - 自带互斥锁；保存用「临时文件 + rename」原子写；自动剪枝 90 天
 - 由 `scheduler` 在番茄钟完成 / 时间点命中时调用（与 emit / 勿扰无关，反映真实触发）
+
+---
+
+## 9. `internal/i18n`
+
+界面多语言（仅翻译「界面外壳」，不翻译用户配置的提醒内容 / 诗词）。
+
+### 9.1 支持的语言
+
+| 代码 | 显示名（`Name`） |
+|---|---|
+| `zh-CN` | 简体中文（默认 / 回落语言） |
+| `zh-TW` | 繁體中文 |
+| `en`    | English |
+| `ja`    | 日本語 |
+| `ko`    | 한국어 |
+
+- `config.Language` 存语言代码；`ApplyDefaults` / `Load` 会把它归一化为受支持语言，未知值回落 `zh-CN`。
+- 语言只影响 UI 文案（托盘菜单/tooltip、设置面板、弹窗按钮、天气、系统 MessageBox、调度器生成的提醒标题）。**用户自己填的 timepoint 文案、诗词保持原样，不做机翻。**
+
+### 9.2 函数
+
+#### `T(l Lang, key string) string`
+- 纯查表翻译；缺失时回落 `zh-CN`，再回落 key 本身（永不返回空串以外的「报错」）。
+- **不做格式化**：需要 `%d` 等占位时，调用方用 `fmt.Sprintf(i18n.T(lang, key), args...)` 包裹（避免 `go vet` 把 key 当成 printf 格式串告警）。
+
+#### `Supported() []Lang` / `Name(l Lang) string` / `Norm(l Lang) Lang`
+- `Supported` 返回下拉顺序（zh-CN → zh-TW → en → ja → ko）。
+- `Name` 返回本地化显示名（用于设置下拉）。
+- `Norm` 把任意输入规范为受支持语言，未知回落 `zh-CN`（包外使用；包内 `norm` 是其别名）。
+
+#### `WeatherText(l Lang, code int) (emoji, text string)`
+- 把 WMO weather code 映射为 emoji + 语言化文案；`code` 未知时 emoji 回落 `🌡️`、文案回落 `weather.unknown`。
+
+#### `Dict(l Lang) map[string]string`
+- 返回某语言的完整字典（该语言条目覆盖在 `zh-CN` 之上），供设置面板整体注入前端、由 JS 的 `t(key)` 查表。
+
+### 9.3 加新语言 / 新 key 的流程
+
+1. **加语言**：在 `i18n.go` 的 `Lang` 常量、`supported` 列表、新增语言 map（以 `ZhCN` 为基底复制，逐 key 翻译）里各加一项。
+2. **加 key**：所有语言 map 都加同一 key（至少 `ZhCN` 必须有）；`T` 会对缺失 key 回落 `ZhCN` 再回落 key 本身，但建议补全以免其它语言显示原文。
+3. **前端注入**：设置面板读取 `i18n.Dict(lang)` + `i18n.Supported()`，无需新增 per-language HTML 模板。
+4. **字体**：`popup.go` 字体栈已含 `"Microsoft JhengHei", "Malgun Gothic", "Yu Gothic", "Meiryo"`，覆盖繁中/韩/日字形。
 

@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	"pomodoro-notifier/internal/i18n"
 )
 
 // openInExplorer 打开指定目录（Windows 用 explorer，Mac/Linux 用 xdg-open/open）。
@@ -22,14 +24,9 @@ func openInExplorer(dir string) {
 	}
 }
 
-func showAbout() {
-	showInfo("关于 PomodoroNotifier",
-		"PomodoroNotifier 1.0\n\n"+
-			"• 番茄钟循环 + 指定时间点提醒\n"+
-			"• 随机诗词/名言（在线 + 离线兜底）\n"+
-			"• WebView2 精美弹窗\n\n"+
-			"左键托盘 = 立即弹一次\n"+
-			"右键托盘 = 菜单")
+func showAbout(lang i18n.Lang) {
+	showInfo(i18n.T(lang, "about.title"),
+		i18n.T(lang, "about.body"))
 }
 
 func showError(title, msg string) { showInfo(title, msg) }

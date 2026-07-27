@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"pomodoro-notifier/internal/i18n"
 )
 
 type QuoteAPIConfig struct {
@@ -104,6 +106,7 @@ type WeatherConfig struct {
 type AppConfig struct {
 	LogFile   string          `json:"log_file"`
 	TimeZone  string          `json:"timezone"`
+	Language  string          `json:"language"` // 界面语言；空=zh-CN
 	QuoteAPI  QuoteAPIConfig  `json:"quote_api"`
 	Popup     PopupConfig     `json:"popup"`
 	Pomodoro  PomodoroConfig  `json:"pomodoro"`
@@ -112,11 +115,18 @@ type AppConfig struct {
 	Autostart bool            `json:"autostart"`
 }
 
-// DefaultConfig 返回默认配置；路径字段需要在调用方按 exe 目录覆盖。
+// DefaultConfig 返回默认配置（界面语言 zh-CN）；路径字段需要在调用方按 exe 目录覆盖。
 func DefaultConfig() AppConfig {
+	return defaultConfigFor(i18n.ZhCN)
+}
+
+// defaultConfigFor 按指定语言返回默认配置；内置提醒文案随语言本地化。
+// 用户已自定义的文案（写在 config.json 里的）不会被这里覆盖。
+func defaultConfigFor(lang i18n.Lang) AppConfig {
 	return AppConfig{
 		LogFile:  "pomodoro.log",
 		TimeZone: "",
+		Language: string(lang),
 		QuoteAPI: QuoteAPIConfig{
 			URL:     "https://v1.hitokoto.cn/?encode=json",
 			Timeout: "1500ms",
@@ -137,8 +147,8 @@ func DefaultConfig() AppConfig {
 			WorkDays:     []int{1, 2, 3, 4, 5},
 			WorkStart:    "09:00",
 			WorkEnd:      "18:00",
-			WorkText:     "休息时间到！站起来活动一下、眺望远处。",
-			BreakText:    "休息结束，开始下一个番茄钟。",
+			WorkText:     i18n.T(lang, "default.pomodoro_work"),
+			BreakText:    i18n.T(lang, "default.pomodoro_break"),
 		},
 		Timepoint: TimepointConfig{
 			Enabled: true,
@@ -147,8 +157,8 @@ func DefaultConfig() AppConfig {
 				{Time: "14:30"},
 				{Time: "17:30"},
 			},
-			Title:   "温馨提醒",
-			Message: "到点啦，起来走走，喝口水，看看远处。",
+			Title:   i18n.T(lang, "default.timepoint_title"),
+			Message: i18n.T(lang, "default.timepoint_message"),
 		},
 		Weather: WeatherConfig{
 			Enabled: true,
@@ -162,6 +172,11 @@ func DefaultConfig() AppConfig {
 func (c *AppConfig) ApplyDefaults() {
 	if c.LogFile == "" {
 		c.LogFile = "pomodoro.log"
+	}
+	// 规范语言：空或未知 → zh-CN
+	c.Language = string(i18n.Norm(i18n.Lang(c.Language)))
+	if c.QuoteAPI.URL == "" {
+		c.QuoteAPI.URL = "https://v1.hitokoto.cn/?encode=json"
 	}
 	if c.Popup.Width <= 0 {
 		c.Popup.Width = 560
@@ -186,9 +201,6 @@ func (c *AppConfig) ApplyDefaults() {
 	default:
 		c.Popup.Position = "bottom-right"
 	}
-	if c.QuoteAPI.URL == "" {
-		c.QuoteAPI.URL = "https://v1.hitokoto.cn/?encode=json"
-	}
 	if c.QuoteAPI.Timeout == "" {
 		c.QuoteAPI.Timeout = "1500ms"
 	}
@@ -198,12 +210,20 @@ func (c *AppConfig) ApplyDefaults() {
 }
 
 // Load 从 path 读取配置，失败返回错误（调用方负责决定是否生成默认）。
+// 先读原始 JSON 里的 language 字段，用它挑选对应语言的默认内置文案，
+// 再做 unmarshal 覆盖——保证缺省字段跟随文件自身的语言，而不是永远 zh-CN。
 func Load(path string) (AppConfig, error) {
-	cfg := DefaultConfig()
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return cfg, err
+		return DefaultConfig(), err
 	}
+	lang := i18n.ZhCN
+	if raw := struct {
+		Language string `json:"language"`
+	}{}; json.Unmarshal(b, &raw) == nil && raw.Language != "" {
+		lang = i18n.Norm(i18n.Lang(raw.Language))
+	}
+	cfg := defaultConfigFor(lang)
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, err
 	}

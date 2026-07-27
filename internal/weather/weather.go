@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"pomodoro-notifier/internal/i18n"
 )
 
 // httpClient 强制使用 HTTP/1.1，并优先尝试 IPv4。
@@ -67,24 +69,19 @@ type Weather struct {
 }
 
 // Fetch 通过 Open-Meteo（无需 API key）获取指定城市的当前天气。
-// 流程：先用城市名地理编码得到经纬度，再拉取当前天气。
-// 任何一步失败都返回 error，由调用方决定兜底（通常静默忽略天气）。
-func Fetch(ctx context.Context, city string) (Weather, error) {
+// lang 用于本地化天气文案（emoji 与语言无关）。
+func Fetch(ctx context.Context, city string, lang string) (Weather, error) {
 	city = strings.TrimSpace(city)
 	if city == "" {
 		return Weather{}, fmt.Errorf("city is empty")
 	}
-	// 地理编码 + 当前天气是两次串行网络请求，且各自内部还有一次重试
-	// （每次请求 5s 客户端超时）。给整次抓取一个充足的总超时（12s），
-	// 同时尊重调用方 ctx 的取消。注意：不要把调用方那个偏短的 context
-	// 直接作为硬上限，否则前一步请求消耗掉预算后，后一步必然超时。
 	fetchCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	lat, lon, err := geocode(fetchCtx, city)
 	if err != nil {
 		return Weather{}, err
 	}
-	return fetchCurrent(fetchCtx, lat, lon, city)
+	return fetchCurrent(fetchCtx, lat, lon, city, lang)
 }
 
 // 中国主要城市经纬度表（WGS-84）。
@@ -183,7 +180,7 @@ func geocode(ctx context.Context, city string) (float64, float64, error) {
 	return g.Results[0].Latitude, g.Results[0].Longitude, nil
 }
 
-func fetchCurrent(ctx context.Context, lat, lon float64, city string) (Weather, error) {
+func fetchCurrent(ctx context.Context, lat, lon float64, city string, lang string) (Weather, error) {
 	api := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current_weather=true", lat, lon)
 	resp, err := getURL(ctx, api)
 	if err != nil {
@@ -202,7 +199,7 @@ func fetchCurrent(ctx context.Context, lat, lon float64, city string) (Weather, 
 	if err := json.NewDecoder(resp.Body).Decode(&f); err != nil {
 		return Weather{}, err
 	}
-	emoji, text := describe(f.CurrentWeather.WeatherCode)
+	emoji, text := i18n.WeatherText(i18n.Lang(lang), f.CurrentWeather.WeatherCode)
 	return Weather{
 		City:        city,
 		Temperature: f.CurrentWeather.Temperature,
@@ -211,44 +208,6 @@ func fetchCurrent(ctx context.Context, lat, lon float64, city string) (Weather, 
 		Emoji:       emoji,
 		IsDay:       f.CurrentWeather.IsDay,
 	}, nil
-}
-
-// describe 把 WMO weather code 映射为 emoji + 中文文案。
-func describe(code int) (string, string) {
-	switch code {
-	case 0:
-		return "☀️", "晴"
-	case 1:
-		return "🌤️", "晴间多云"
-	case 2:
-		return "⛅", "局部多云"
-	case 3:
-		return "☁️", "阴"
-	case 45, 48:
-		return "🌫️", "雾"
-	case 51, 53, 55:
-		return "🌦️", "毛毛雨"
-	case 56, 57:
-		return "🌧️", "冻毛毛雨"
-	case 61, 63, 65:
-		return "🌧️", "雨"
-	case 66, 67:
-		return "🌧️", "冻雨"
-	case 71, 73, 75:
-		return "🌨️", "雪"
-	case 77:
-		return "🌨️", "雪粒"
-	case 80, 81, 82:
-		return "🌦️", "阵雨"
-	case 85, 86:
-		return "🌨️", "阵雪"
-	case 95:
-		return "⛈️", "雷阵雨"
-	case 96, 99:
-		return "⛈️", "雷阵雨伴冰雹"
-	default:
-		return "🌡️", "未知"
-	}
 }
 
 // TempString 把温度格式化为整数度的字符串（如 "26°C"）。

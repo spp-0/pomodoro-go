@@ -14,6 +14,7 @@ import (
 
 	"github.com/Krakinsight/go-webview2"
 
+	"pomodoro-notifier/internal/i18n"
 	"pomodoro-notifier/internal/logging"
 	"pomodoro-notifier/internal/quote"
 	"pomodoro-notifier/internal/scheduler"
@@ -35,6 +36,7 @@ type Options struct {
 	TopMost          bool
 	Position         string // center / top-left / top-right / bottom-left / bottom-right
 	Loc             *time.Location // 弹窗时间显示所用时区；nil 时回退 time.Local
+	Lang             string         // 界面语言；空=zh-CN
 	SoundEnabled    bool           // 是否播放提醒音
 	SoundFile       string         // 自定义 wav 路径；空=系统默认提示音
 	OnSnooze        func(minutes int) // 非 nil 时显示“稍后提醒”按钮
@@ -47,33 +49,37 @@ type data struct {
 	Title         string
 	Message       string
 	Kind          string
-	Badge         string // 面向用户的中文标签（由 Kind 映射）
+	Badge         string // 面向用户的标签（由 Kind 映射，已本地化）
 	TimeText      string
 	Quote         string
 	Author        string
 	Source        string
 	AutoClose     int
 	PayloadB64    string
-	SnoozeEnabled bool // 是否显示“稍后提醒”按钮
-	WeatherEnabled bool // 是否在弹窗内显示天气（决定占位块）
+	SnoozeEnabled bool   // 是否显示“稍后提醒”按钮
+	WeatherEnabled bool   // 是否在弹窗内显示天气（决定占位块）
+	// 以下为本地化的界面文案（替代模板里写死的字符串）
+	WeatherLoading string
+	WeatherError   string
+	SnoozeLabel   string
+	Snooze5       string
+	Snooze10      string
+	Snooze15      string
+	AutoCloseText  string
+	CloseText      string
+	Lang           string // 注入到 <html lang>，利于字体/可访问性
+	DataError      string // 兜底解析失败时的本地化提示
 }
 
-// friendlyBadge 把内部事件类型映射为面向用户的中文标签。
-func friendlyBadge(kind string) string {
-	switch kind {
-	case "pomodoro_break_start":
-		return "休息提醒"
-	case "pomodoro_break_end":
-		return "开始专注"
-	case "timepoint":
-		return "定时提醒"
-	case "manual":
-		return "手动提醒"
-	case "test":
-		return "测试"
-	default:
-		return "提醒"
+// badge 把内部事件类型映射为面向用户的本地化标签。
+func badge(lang string, kind string) string {
+	key := "popup.badge." + kind
+	t := i18n.T(i18n.Lang(lang), key)
+	if t == key {
+		// 未知 kind 回落到 default 标签
+		return i18n.T(i18n.Lang(lang), "popup.badge.default")
 	}
+	return t
 }
 
 func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.Logger) error {
@@ -91,22 +97,34 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 		tz = time.Local
 	}
 
+	lang := i18n.Lang(opt.Lang)
 	d := data{
 		Title:     strings.TrimSpace(e.Title),
 		Message:   strings.TrimSpace(e.Message),
 		Kind:      e.Kind,
-		Badge:     friendlyBadge(e.Kind),
+		Badge:     badge(opt.Lang, e.Kind),
 		TimeText:  e.At.In(tz).Format("2006-01-02 15:04:05"),
 		Quote:     q.Text,
 		Author:    q.Author,
 		Source:    q.Source,
 		AutoClose: opt.AutoCloseSeconds,
+		// 本地化界面文案（替代模板写死的中文）
+		WeatherLoading: i18n.T(lang, "popup.weather_loading"),
+		WeatherError:   i18n.T(lang, "popup.weather_error"),
+		SnoozeLabel:  i18n.T(lang, "popup.snooze_label"),
+		Snooze5:      i18n.T(lang, "popup.snooze_5"),
+		Snooze10:     i18n.T(lang, "popup.snooze_10"),
+		Snooze15:     i18n.T(lang, "popup.snooze_15"),
+		AutoCloseText: i18n.T(lang, "popup.auto_close"),
+		CloseText:     i18n.T(lang, "popup.close"),
+		Lang:           opt.Lang,
+		DataError:      i18n.T(lang, "popup.data_error"),
 	}
 	if d.Title == "" {
-		d.Title = "提醒"
+		d.Title = i18n.T(lang, "popup.title_fallback")
 	}
 	if d.Message == "" {
-		d.Message = "到点啦，起来活动一下。"
+		d.Message = i18n.T(lang, "popup.msg_fallback")
 	}
 	if d.Quote == "" {
 		d.Quote = quote.Fallback().Text
@@ -179,14 +197,15 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 		go func() {
 			wctx, wcancel := context.WithTimeout(context.Background(), 12*time.Second)
 			defer wcancel()
-			wth, werr := weather.Fetch(wctx, city)
+			wth, werr := weather.Fetch(wctx, city, opt.Lang)
 			if werr != nil {
 				if log != nil {
 					log.Printf("[weather] fetch failed for city=%s: %v", city, werr)
 				}
 				if !closedFlag.Load() {
+					b, _ := json.Marshal(d.WeatherError)
 					w.Dispatch(func() {
-						w.Eval("renderWeatherError('天气获取失败');")
+						w.Eval("renderWeatherError(" + string(b) + ");")
 					})
 				}
 				return
@@ -279,7 +298,7 @@ func computeLocation(opt Options) (*webview2.Location, bool) {
 }
 
 const pageTemplate = `<!doctype html>
-<html lang="zh-CN">
+<html lang="{{.Lang}}">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -296,7 +315,7 @@ const pageTemplate = `<!doctype html>
       --border:#334155;
       --shadow: 0 24px 80px rgba(0,0,0,.55);
     }
-    html,body{height:100%; margin:0; font-family: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial;}
+    html,body{height:100%; margin:0; font-family: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Microsoft JhengHei", "Malgun Gothic", "Yu Gothic", "Meiryo", Arial;}
     body{
       display:flex; align-items:center; justify-content:center;
       background: radial-gradient(1200px 600px at 20% 10%, rgba(96,165,250,.28), transparent 60%),
@@ -401,7 +420,7 @@ const pageTemplate = `<!doctype html>
     </h2>
     <div class="msg" id="msg">{{.Message}}</div>
     {{if .WeatherEnabled}}
-    <div class="weather" id="weather"><span class="w-loading">正在获取天气…</span></div>
+    <div class="weather" id="weather"><span class="w-loading">{{.WeatherLoading}}</span></div>
     {{end}}
     <div class="quote">
       <div class="text" id="qtext">{{.Quote}}</div>
@@ -409,17 +428,17 @@ const pageTemplate = `<!doctype html>
     </div>
     {{if .SnoozeEnabled}}
     <div class="snooze" id="snooze">
-      <span class="snooze-label">稍后提醒</span>
-      <button class="btn snooze-btn" data-min="5">5 分钟</button>
-      <button class="btn snooze-btn" data-min="10">10 分钟</button>
-      <button class="btn snooze-btn" data-min="15">15 分钟</button>
+      <span class="snooze-label">{{.SnoozeLabel}}</span>
+      <button class="btn snooze-btn" data-min="5">{{.Snooze5}}</button>
+      <button class="btn snooze-btn" data-min="10">{{.Snooze10}}</button>
+      <button class="btn snooze-btn" data-min="15">{{.Snooze15}}</button>
     </div>
     {{end}}
     <div class="footer">
       <span id="time">{{.TimeText}}</span>
       <span>
-        <span class="timer" id="timer">{{.AutoClose}}</span>s 后自动关闭
-        <button class="btn" id="close">知道了</button>
+        <span class="timer" id="timer">{{.AutoClose}}</span>{{.AutoCloseText}}
+        <button class="btn" id="close">{{.CloseText}}</button>
       </span>
     </div>
   </div>
@@ -467,6 +486,7 @@ window.renderWeatherError = function(text){
 (function(){
   // 通过 base64 注入的兜底数据，防止模板里出现空字符串
   var b64 = "{{.PayloadB64}}";
+  var DATA_ERROR = "{{.DataError}}";
   try {
     var json = atob(b64);
     var bytes = new Uint8Array(json.length);
@@ -481,7 +501,7 @@ window.renderWeatherError = function(text){
     if (d && d.author)  document.getElementById("qmeta").textContent  = "— " + d.author + (d.source ? " · " + d.source : "");
     if (d && d.time_text) document.getElementById("time").textContent = d.time_text;
   } catch (e) {
-    document.getElementById("msg").textContent = "弹窗数据解析失败: " + e;
+    document.getElementById("msg").textContent = DATA_ERROR + e;
   }
 
   var sec = parseInt(document.getElementById("timer").textContent, 10) || 20;

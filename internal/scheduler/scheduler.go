@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"pomodoro-notifier/internal/config"
+	"pomodoro-notifier/internal/i18n"
 	"pomodoro-notifier/internal/stats"
 )
 
@@ -351,16 +352,18 @@ func (s *ServiceScheduler) tickPomodoro(cfg config.AppConfig, now time.Time, emi
 
 	switch s.pomo.phase {
 	case "work":
-		title := "🍅 休息时间到！"
-		msg := fmt.Sprintf("工作了 %d 分钟，休息 %d 分钟。%s", cfg.Pomodoro.WorkMinutes, cfg.Pomodoro.BreakMinutes, cfg.Pomodoro.BreakText)
+		lang := i18n.Lang(cfg.Language)
+		title := i18n.T(lang, "pomodoro.break_start_title")
+		msg := fmt.Sprintf(i18n.T(lang, "pomodoro.work_prefix"), cfg.Pomodoro.WorkMinutes, cfg.Pomodoro.BreakMinutes) + cfg.Pomodoro.BreakText
 		toFire = append(toFire, PopupEvent{Kind: "pomodoro_break_start", Title: title, Message: msg, At: now})
 		s.recordPomodoroLocked(dayKey)
 		s.pomo.phase = "break"
 		s.pomo.nextAt = now.Add(time.Duration(cfg.Pomodoro.BreakMinutes) * time.Minute)
 		s.setStateLocked(StateBreak)
 	case "break":
-		title := "🍅 休息结束"
-		msg := "休息时间到，开始下一个番茄钟！"
+		lang := i18n.Lang(cfg.Language)
+		title := i18n.T(lang, "pomodoro.break_end_title")
+		msg := i18n.T(lang, "default.pomodoro_break")
 		if strings.TrimSpace(cfg.Pomodoro.WorkText) != "" {
 			msg = cfg.Pomodoro.WorkText
 		}
@@ -415,14 +418,14 @@ func (s *ServiceScheduler) tickTimepoints(cfg config.AppConfig, now time.Time, e
 			title = strings.TrimSpace(cfg.Timepoint.Title)
 		}
 		if title == "" {
-			title = "温馨提醒"
+			title = i18n.T(i18n.Lang(cfg.Language), "default.timepoint_title")
 		}
 		msg := strings.TrimSpace(it.Message)
 		if msg == "" {
 			msg = strings.TrimSpace(cfg.Timepoint.Message)
 		}
 		if msg == "" {
-			msg = "到点啦，起来走走。"
+			msg = i18n.T(i18n.Lang(cfg.Language), "default.timepoint_message")
 		}
 		toFire = append(toFire, PopupEvent{Kind: "timepoint", Title: title, Message: msg, At: now})
 	}

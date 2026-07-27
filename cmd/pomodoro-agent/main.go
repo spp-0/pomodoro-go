@@ -15,6 +15,7 @@ import (
 	"github.com/gogpu/systray"
 
 	"pomodoro-notifier/internal/config"
+	"pomodoro-notifier/internal/i18n"
 	"pomodoro-notifier/internal/logging"
 	"pomodoro-notifier/internal/quote"
 	"pomodoro-notifier/internal/scheduler"
@@ -59,6 +60,7 @@ func main() {
 	if err != nil {
 		fail("resolve config: %v", err)
 	}
+	var lang i18n.Lang
 	cfg, err := config.Load(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -70,12 +72,13 @@ func main() {
 		} else {
 			// 配置解析失败：降级为默认配置 + 弹窗提示，但不退出，
 			// 保证工具始终能启动（提醒类工具“起不来”比“弹错”更糟）。
-			showInfo("配置有误", "配置文件存在错误，已使用默认配置。\n请检查: "+path+"\n\n"+err.Error())
+			showInfo(i18n.T(lang, "cfgerror.title"), i18n.T(lang, "cfgerror.msg")+path+"\n\n"+err.Error())
 			cfg = config.DefaultConfig()
 			cfg.LogFile = "pomodoro.log"
 		}
 	}
 	cfg.LogFile = filepath.Join(filepath.Dir(path), filepath.Base(cfg.LogFile))
+	lang = i18n.Lang(cfg.Language) // 整个进程生命周期内的界面语言（设置变更会热重载配置，但托盘菜单/提示在启动时构建一次）
 	logger := logging.New(cfg.LogFile)
 	logger.Printf("start config=%s", path)
 
@@ -102,6 +105,7 @@ func main() {
 			AutoCloseSeconds: cfg.Popup.AutoCloseSeconds,
 			TopMost:          cfg.Popup.TopMost,
 			Position:         cfg.Popup.Position,
+			Lang:             cfg.Language,
 			SoundEnabled:     cfg.Popup.Sound.Enabled,
 			SoundFile:        cfg.Popup.Sound.File,
 		}, logger)
@@ -153,6 +157,7 @@ func main() {
 			TopMost:          cur.Popup.TopMost,
 			Position:         cur.Popup.Position,
 			Loc:              loc,
+			Lang:             cur.Language,
 			SoundEnabled:     cur.Popup.Sound.Enabled,
 			SoundFile:        cur.Popup.Sound.File,
 			OnSnooze: func(mins int) {
@@ -178,9 +183,9 @@ func main() {
 
 	// 启动托盘消息循环（阻塞直到退出）
 	tray := systray.New()
-	applyTrayState(tray, scheduler.StateIdle, &paused)
-	tray.SetTooltip("🍅 PomodoroNotifier")
-	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store)
+	applyTrayState(tray, scheduler.StateIdle, &paused, lang)
+	tray.SetTooltip(i18n.T(lang, "tray.toolip.normal"))
+	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store, lang)
 	tray.SetMenu(menu)
 
 	// 注册 scheduler 状态切换 → 切托盘图标
@@ -189,16 +194,16 @@ func main() {
 		if paused.Load() {
 			display = scheduler.StateIdle
 		}
-		applyTrayState(tray, display, &paused)
+		applyTrayState(tray, display, &paused, lang)
 	})
 
 	// 调度主循环：每秒推进调度，并刷新托盘 tooltip（相位剩余 + 今日番茄数）。
-	go func() {
+		go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			sched.Tick(now)
-			updateTrayTooltip(tray, sched, store, &dnd, now)
+			updateTrayTooltip(tray, sched, store, &dnd, lang, now)
 		}
 	}()
 
@@ -211,22 +216,22 @@ func main() {
 }
 
 // applyTrayState 根据状态切换托盘图标。
-func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic.Bool) {
+func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic.Bool, lang i18n.Lang) {
 	var png []byte
 	var tip string
 	switch st {
 	case scheduler.StateWork:
 		png = trayWorkPNG
-		tip = "🍅 PomodoroNotifier - 专注中"
+		tip = i18n.T(lang, "tray.toolip.work")
 	case scheduler.StateBreak:
 		png = trayBreakPNG
-		tip = "🍅 PomodoroNotifier - 休息中"
+		tip = i18n.T(lang, "tray.toolip.break")
 	default:
 		png = trayPausePNG
 		if paused != nil && paused.Load() {
-			tip = "🍅 PomodoroNotifier - 已暂停"
+			tip = i18n.T(lang, "tray.toolip.paused")
 		} else {
-			tip = "🍅 PomodoroNotifier - 待命中"
+			tip = i18n.T(lang, "tray.toolip.idle")
 		}
 	}
 	tray.SetIcon(png)
@@ -234,9 +239,9 @@ func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic
 }
 
 // updateTrayTooltip 每秒刷新托盘悬浮提示：相位剩余时间 + 今日番茄数。
-func updateTrayTooltip(tray *systray.SystemTray, sched *scheduler.ServiceScheduler, store *stats.Store, dnd *atomic.Bool, now time.Time) {
+func updateTrayTooltip(tray *systray.SystemTray, sched *scheduler.ServiceScheduler, store *stats.Store, dnd *atomic.Bool, lang i18n.Lang, now time.Time) {
 	if dnd.Load() {
-		tray.SetTooltip("🌙 PomodoroNotifier - 勿扰中（会议）")
+		tray.SetTooltip(i18n.T(lang, "tray.toolip.dnd"))
 		return
 	}
 	phase, remaining := sched.PomodoroStatus(now)
@@ -244,11 +249,11 @@ func updateTrayTooltip(tray *systray.SystemTray, sched *scheduler.ServiceSchedul
 	var tip string
 	switch phase {
 	case "work":
-		tip = fmt.Sprintf("🍅 专注中 · 剩余 %s · 今日 %d🍅", remaining.Round(time.Second), today)
+		tip = fmt.Sprintf(i18n.T(lang, "tray.status.work"), remaining.Round(time.Second), today)
 	case "break":
-		tip = fmt.Sprintf("☕ 休息中 · 剩余 %s · 今日 %d🍅", remaining.Round(time.Second), today)
+		tip = fmt.Sprintf(i18n.T(lang, "tray.status.break"), remaining.Round(time.Second), today)
 	default:
-		tip = fmt.Sprintf("🍅 待命 · 今日 %d🍅", today)
+		tip = fmt.Sprintf(i18n.T(lang, "tray.status.idle"), today)
 	}
 	tray.SetTooltip(tip)
 }
@@ -260,55 +265,55 @@ func resolveConfigPath(flagPath string) (string, error) {
 	return config.DefaultConfigPath()
 }
 
-func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) *systray.Menu {
+func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store, lang i18n.Lang) *systray.Menu {
 	m := systray.NewMenu()
-	m.Add("立即弹一次", func() { emitManual(sched) })
-	m.Add("设置…", func() { openSettings(cfgPath, sched, logger, store) })
+	m.Add(i18n.T(lang, "tray.menu.popup"), func() { emitManual(sched) })
+	m.Add(i18n.T(lang, "tray.menu.settings"), func() { openSettings(cfgPath, sched, logger, store) })
 	m.AddSeparator()
-	m.AddCheckbox("暂停调度（点击切换）", false, func() {
+	m.AddCheckbox(i18n.T(lang, "tray.menu.pause"), false, func() {
 		if paused.Load() {
 			paused.Store(false)
 			logger.Printf("resume")
 			// 恢复后图标按 scheduler 当前实际状态
-			applyTrayState(tray, sched.State(), paused)
+			applyTrayState(tray, sched.State(), paused, lang)
 		} else {
 			paused.Store(true)
 			sched.Pause()
 			logger.Printf("paused")
-			applyTrayState(tray, scheduler.StateIdle, paused)
+			applyTrayState(tray, scheduler.StateIdle, paused, lang)
 		}
 	})
-	m.AddCheckbox("勿扰模式（会议）", dnd.Load(), func() {
+	m.AddCheckbox(i18n.T(lang, "tray.menu.dnd"), dnd.Load(), func() {
 		enabled := !dnd.Load()
 		dnd.Store(enabled)
 		if enabled {
-			tray.ShowNotification("PomodoroNotifier", "已进入勿扰模式，提醒暂不弹窗（番茄钟继续计时）")
+			tray.ShowNotification("PomodoroNotifier", i18n.T(lang, "tray.notify.dnd_on"))
 		} else {
-			tray.ShowNotification("PomodoroNotifier", "已退出勿扰模式")
+			tray.ShowNotification("PomodoroNotifier", i18n.T(lang, "tray.notify.dnd_off"))
 		}
 		logger.Printf("dnd=%v", enabled)
 	})
-	m.Add("跳过当前休息", func() {
+	m.Add(i18n.T(lang, "tray.menu.skip"), func() {
 		if ok := sched.SkipBreak(); !ok {
-			showInfo("跳过休息", "当前不在休息阶段，无法跳过。")
+			showInfo(i18n.T(lang, "info.skip.title"), i18n.T(lang, "info.skip.msg"))
 		} else {
 			logger.Printf("skip break")
 		}
 	})
-	m.Add("延长休息 5 分钟", func() {
+	m.Add(i18n.T(lang, "tray.menu.extend"), func() {
 		if ok := sched.ExtendBreak(5); !ok {
-			showInfo("延长休息", "当前不在休息阶段，无法延长。")
+			showInfo(i18n.T(lang, "info.extend.title"), i18n.T(lang, "info.extend.msg"))
 		} else {
 			logger.Printf("extend break 5min")
 		}
 	})
-	m.AddCheckbox("声音", sched.CurrentConfig().Popup.Sound.Enabled, func() {
+	m.AddCheckbox(i18n.T(lang, "tray.menu.sound"), sched.CurrentConfig().Popup.Sound.Enabled, func() {
 		cur := sched.CurrentConfig()
 		enabled := !cur.Popup.Sound.Enabled
 		if c, err := config.Load(cfgPath); err == nil {
 			c.Popup.Sound.Enabled = enabled
 			if err := config.Save(cfgPath, c); err != nil {
-				showInfo("声音", "保存失败: "+err.Error())
+				showInfo(i18n.T(lang, "info.sound.title"), i18n.T(lang, "info.sound.msg")+err.Error())
 				return
 			}
 			loc, _ := c.Location()
@@ -316,17 +321,17 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 			logger.Printf("sound enabled=%v", enabled)
 		}
 	})
-	m.AddCheckbox("开机自启", sched.CurrentConfig().Autostart, func() {
+	m.AddCheckbox(i18n.T(lang, "tray.menu.autostart"), sched.CurrentConfig().Autostart, func() {
 		cur := sched.CurrentConfig()
 		enabled := !cur.Autostart
 		if err := setAutostart(enabled); err != nil {
-			showInfo("开机自启", "设置失败: "+err.Error())
+			showInfo(i18n.T(lang, "info.autostart.title"), i18n.T(lang, "info.autostart.msg")+err.Error())
 			return
 		}
 		if c, err := config.Load(cfgPath); err == nil {
 			c.Autostart = enabled
 			if err := config.Save(cfgPath, c); err != nil {
-				showInfo("开机自启", "保存失败: "+err.Error())
+				showInfo(i18n.T(lang, "info.autostart.title"), i18n.T(lang, "info.autostart.msg")+err.Error())
 				return
 			}
 			loc, _ := c.Location()
@@ -334,18 +339,18 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 		}
 		logger.Printf("autostart=%v", enabled)
 	})
-	m.Add("重新加载配置", func() {
+	m.Add(i18n.T(lang, "tray.menu.reload"), func() {
 		if err := reloadConfig(cfgPath, sched, logger); err != nil {
 			logger.Printf("reload failed: %v", err)
-			showError("重新加载失败", err.Error())
+			showError(i18n.T(lang, "info.reload.title"), err.Error())
 		} else {
-			tray.ShowNotification("PomodoroNotifier", "配置已重新加载")
+			tray.ShowNotification("PomodoroNotifier", i18n.T(lang, "tray.notify.reloaded"))
 		}
 	})
-	m.Add("打开配置目录", func() { openInExplorer(filepath.Dir(cfgPath)) })
+	m.Add(i18n.T(lang, "tray.menu.opendir"), func() { openInExplorer(filepath.Dir(cfgPath)) })
 	m.AddSeparator()
-	m.Add("关于", func() { showAbout() })
-	m.Add("退出", func() { tray.Remove(); tray.Hide(); os.Exit(0) })
+	m.Add(i18n.T(lang, "tray.menu.about"), func() { showAbout(lang) })
+	m.Add(i18n.T(lang, "tray.menu.exit"), func() { tray.Remove(); tray.Hide(); os.Exit(0) })
 	return m
 }
 
@@ -377,7 +382,8 @@ func startUIDispatcher(logger *logging.Logger, sched *scheduler.ServiceScheduler
 				// 避免提醒静默丢失；仅首次失败时提示，避免消息框刷屏。
 				if webviewWarned.CompareAndSwap(false, true) {
 					showInfo(job.e.Title, job.e.Message)
-					showInfo("提醒组件异常", "弹窗渲染失败，已用系统消息框兜底提醒。\n可能缺少 WebView2 Runtime，请安装后重启。")
+					cl := i18n.Lang(sched.CurrentConfig().Language)
+					showInfo(i18n.T(cl, "info.webview.title"), i18n.T(cl, "info.webview.msg"))
 				}
 			} else {
 				logger.Printf("[ui] ShowPopup OK")
@@ -387,10 +393,11 @@ func startUIDispatcher(logger *logging.Logger, sched *scheduler.ServiceScheduler
 }
 
 func emitManual(sched *scheduler.ServiceScheduler) {
+	lang := i18n.Lang(sched.CurrentConfig().Language)
 	e := scheduler.PopupEvent{
 		Kind:    "manual",
-		Title:   "手动提醒",
-		Message: "这是你点击托盘触发的提醒。",
+		Title:   i18n.T(lang, "popup.badge.manual"),
+		Message: i18n.T(lang, "manual.msg"),
 		At:      time.Now(),
 	}
 	cur := sched.CurrentConfig()
@@ -406,6 +413,7 @@ func emitManual(sched *scheduler.ServiceScheduler) {
 			TopMost:          cur.Popup.TopMost,
 			Position:         cur.Popup.Position,
 			Loc:              loc,
+			Lang:             cur.Language,
 			SoundEnabled:     cur.Popup.Sound.Enabled,
 			SoundFile:        cur.Popup.Sound.File,
 			// 手动弹窗同样要带天气（与 emit 路径保持一致），否则手动提醒看不到天气。
