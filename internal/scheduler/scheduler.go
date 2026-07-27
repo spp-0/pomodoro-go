@@ -98,20 +98,28 @@ func (s *ServiceScheduler) UpdateConfig(cfg config.AppConfig, loc *time.Location
 	now := time.Now().In(s.loc)
 	dayKey := now.Format("2006-01-02")
 	s.lastT[dayKey] = map[string]bool{}
-	// 新加的“当前分钟 = HH:MM”的时间点立即触发一次（方便用户改完立刻验证）
-	// 注意：tickTimepoints 也会处理，但本分钟内 tick 还没到；这里直接补一发。
+	// 新加的“当前分钟 = HH:MM”的时间点立即触发一次（方便用户改完立刻验证）。
+	// 锁内只收集要触发的事件，emit 放到解锁后调用——回调里通常会再访问 sched
+	// （如 CurrentConfig），若在锁内调用会与持有的 mu 自死锁（sync.Mutex 不可重入）。
+	var immediate []PopupEvent
 	if emit != nil {
-		s.fireImmediateTimepointsLocked(cfg.Timepoint, now, dayKey, emit)
+		immediate = s.collectImmediateTimepointsLocked(cfg.Timepoint, now, dayKey)
 	}
 	s.mu.Unlock()
+
+	for _, e := range immediate {
+		emit(e)
+	}
 }
 
-// fireImmediateTimepointsLocked 必须在持有 mu 时调用。
-// 仅对“当前分钟 == HH:MM 且本分钟内 lastT 未标记”的项发一次，
-// 然后把这一分钟的 lastT 标记掉，避免 tickTimepoints 再发一次。
-func (s *ServiceScheduler) fireImmediateTimepointsLocked(tp config.TimepointConfig, now time.Time, dayKey string, emit Emitter) {
-	if !tp.Enabled || emit == nil {
-		return
+// collectImmediateTimepointsLocked 必须在持有 mu 时调用。
+// 仅对“当前分钟 == HH:MM 且本分钟内 lastT 未标记”的项收集一次（不直接 emit），
+// 把这一分钟的 lastT 标记掉，避免 tickTimepoints 再发一次。
+// 真正的 emit 由调用方在锁外执行，避免回调内再次加 mu 导致自死锁。
+func (s *ServiceScheduler) collectImmediateTimepointsLocked(tp config.TimepointConfig, now time.Time, dayKey string) []PopupEvent {
+	var out []PopupEvent
+	if !tp.Enabled {
+		return out
 	}
 	for _, it := range tp.Times {
 		h, m, err := parseHM(it.Time)
@@ -140,8 +148,9 @@ func (s *ServiceScheduler) fireImmediateTimepointsLocked(tp config.TimepointConf
 		if msg == "" {
 			msg = "到点啦，起来走走。"
 		}
-		emit(PopupEvent{Kind: "timepoint", Title: title, Message: msg, At: now})
+		out = append(out, PopupEvent{Kind: "timepoint", Title: title, Message: msg, At: now})
 	}
+	return out
 }
 
 // Pause 暂停调度（清空番茄钟状态，停止再触发，但配置不变）。
@@ -274,6 +283,9 @@ func (s *ServiceScheduler) CurrentConfig() config.AppConfig {
 }
 
 // setStateLocked 必须在持有 mu 时调用。
+// 注意：状态监听回调“必须在锁外调用”——回调里通常会再访问 sched
+// （如 CurrentConfig），若在锁内调用会与持有的 mu 自死锁（sync.Mutex 不可重入）。
+// 因此这里只记录变更，真正回调放到解锁后的独立 goroutine 执行。
 func (s *ServiceScheduler) setStateLocked(st State) {
 	if s.state == st {
 		return
@@ -281,7 +293,7 @@ func (s *ServiceScheduler) setStateLocked(st State) {
 	s.state = st
 	fn := s.onState
 	if fn != nil {
-		fn(st)
+		go fn(st)
 	}
 }
 

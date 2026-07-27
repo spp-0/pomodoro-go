@@ -43,9 +43,6 @@ type popupJob struct {
 // 同步调用 ui.ShowPopup，绕过 webview2 库对"调用者线程"的隐式要求。
 var popupQueue = make(chan popupJob, 16)
 
-// webviewWarned 保证“弹窗渲染失败”只提示一次，避免消息框刷屏。
-var webviewWarned atomic.Bool
-
 // trayLang 记录当前托盘菜单（右击菜单）渲染所用的语言，用于判断语言是否变化、
 // 从而决定是否重建菜单。配置热重载后语言可能变化，但托盘菜单在启动时只构建一次，
 // 故需据此对比并主动重建。
@@ -186,19 +183,9 @@ func main() {
 	lang := i18n.Lang(sched.CurrentConfig().Language)
 	trayLang = string(lang)
 	applyTrayState(tray, scheduler.StateIdle, &paused, lang)
-	tray.SetTooltip(i18n.T(lang, "tray.toolip.normal"))
+	tray.SetTooltip(i18n.T(lang, "tray.tooltip.normal"))
 	menu := buildMenu(tray, path, sched, logger, &paused, &dnd, store)
 	tray.SetMenu(menu)
-
-	// 语言变化 / 外部改配置时重建托盘菜单（菜单只在启动时构建一次，需主动重建）。
-	rebuildMenuIfLangChanged := func() {
-		cur := sched.CurrentConfig().Language
-		if cur == trayLang {
-			return
-		}
-		trayLang = cur
-		tray.SetMenu(buildMenu(tray, path, sched, logger, &paused, &dnd, store))
-	}
 
 	// 注册 scheduler 状态切换 → 切托盘图标（始终按当前语言渲染）
 	sched.SetStateListener(func(st scheduler.State) {
@@ -209,20 +196,33 @@ func main() {
 		applyTrayState(tray, display, &paused, i18n.Lang(sched.CurrentConfig().Language))
 	})
 
-	// 调度主循环：每秒推进调度，并刷新托盘 tooltip（相位剩余 + 今日番茄数）。
+	// 调度主循环：每秒推进调度，并刷新托盘 tooltip；语言变化时通过
+	// tray.RebuildMenu 在 WndProc 线程重建右击菜单。RebuildMenu 内部用
+	// PostMessage 把重建请求投递到托盘窗口，真正的 SetMenu 在 WndProc 内执行，
+	// 既不跨线程操作 HMENU（避免竞态/卡死），也不会在菜单打开时销毁句柄。
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for now := range ticker.C {
 			sched.Tick(now)
 			updateTrayTooltip(tray, sched, store, &dnd, i18n.Lang(sched.CurrentConfig().Language), now)
+			if cur := sched.CurrentConfig().Language; cur != trayLang {
+				trayLang = cur
+				logger.Printf("[tray] language changed -> request menu rebuild (lang=%s)", cur)
+				tray.RebuildMenu(func() *systray.Menu {
+					return buildMenu(tray, path, sched, logger, &paused, &dnd, store)
+				})
+			}
 		}
 	}()
 
-	// 配置热重载监听：文件变化 → 重新载入配置 → 必要时重建菜单。
-	go watchConfig(path, sched, logger, rebuildMenuIfLangChanged)
+	// 配置热重载监听：文件变化 → 重新载入配置（语言变化由上面的每秒循环检测并重建菜单）。
+	go watchConfig(path, sched, logger)
 
-	tray.OnClick(func() { emitManual(sched) })
+	tray.OnClick(func() {
+		logger.Printf("[tray] left-click -> emit manual popup")
+		emitManual(sched, logger)
+	})
 	tray.Show()
 	if err := tray.Run(); err != nil {
 		logger.Printf("tray run: %v", err)
@@ -237,16 +237,16 @@ func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic
 	switch st {
 	case scheduler.StateWork:
 		png = trayWorkPNG
-		tip = i18n.T(lang, "tray.toolip.work")
+		tip = i18n.T(lang, "tray.tooltip.work")
 	case scheduler.StateBreak:
 		png = trayBreakPNG
-		tip = i18n.T(lang, "tray.toolip.break")
+		tip = i18n.T(lang, "tray.tooltip.break")
 	default:
 		png = trayPausePNG
 		if paused != nil && paused.Load() {
-			tip = i18n.T(lang, "tray.toolip.paused")
+			tip = i18n.T(lang, "tray.tooltip.paused")
 		} else {
-			tip = i18n.T(lang, "tray.toolip.idle")
+			tip = i18n.T(lang, "tray.tooltip.idle")
 		}
 	}
 	tray.SetIcon(png)
@@ -256,7 +256,7 @@ func applyTrayState(tray *systray.SystemTray, st scheduler.State, paused *atomic
 // updateTrayTooltip 每秒刷新托盘悬浮提示：相位剩余时间 + 今日番茄数。
 func updateTrayTooltip(tray *systray.SystemTray, sched *scheduler.ServiceScheduler, store *stats.Store, dnd *atomic.Bool, lang i18n.Lang, now time.Time) {
 	if dnd.Load() {
-		tray.SetTooltip(i18n.T(lang, "tray.toolip.dnd"))
+		tray.SetTooltip(i18n.T(lang, "tray.tooltip.dnd"))
 		return
 	}
 	phase, remaining := sched.PomodoroStatus(now)
@@ -283,8 +283,11 @@ func resolveConfigPath(flagPath string) (string, error) {
 func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) *systray.Menu {
 	lang := i18n.Lang(sched.CurrentConfig().Language)
 	m := systray.NewMenu()
-	m.Add(i18n.T(lang, "tray.menu.popup"), func() { emitManual(sched) })
-	m.Add(i18n.T(lang, "tray.menu.settings"), func() { openSettings(tray, cfgPath, sched, logger, paused, dnd, store) })
+	m.Add(i18n.T(lang, "tray.menu.popup"), func() {
+		logger.Printf("[tray] menu 'popup' clicked")
+		emitManual(sched, logger)
+	})
+	m.Add(i18n.T(lang, "tray.menu.settings"), func() { openSettings(cfgPath, sched, logger, store) })
 	m.AddSeparator()
 	m.AddCheckbox(i18n.T(lang, "tray.menu.pause"), false, func() {
 		if paused.Load() {
@@ -371,49 +374,70 @@ func buildMenu(tray *systray.SystemTray, cfgPath string, sched *scheduler.Servic
 }
 
 // openSettings 打开设置窗口；保存成功后通过 onSaved 做附带副作用（如同步开机自启）。
-// 若语言变化，立即重建托盘菜单，使右击菜单即时本地化（配置已在 applySettings 内热重载到 sched）。
-func openSettings(tray *systray.SystemTray, cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, paused *atomic.Bool, dnd *atomic.Bool, store *stats.Store) {
+// 注意：绝不在保存回调里重建托盘菜单——该回调运行在 webview2 的 UI 线程，
+// 在其中调用 Win32 菜单 API 会与 Chromium UI 线程卡死。语言变化后由主循环的
+// 每秒检测（ticker goroutine）负责重建菜单。
+func openSettings(cfgPath string, sched *scheduler.ServiceScheduler, logger *logging.Logger, store *stats.Store) {
 	ui.ShowSettings(cfgPath, sched, logger, func(cfg config.AppConfig) {
 		if err := setAutostart(cfg.Autostart); err != nil {
 			showInfo("开机自启", "设置失败: "+err.Error())
 		}
-		if cfg.Language != trayLang {
-			trayLang = cfg.Language
-			tray.SetMenu(buildMenu(tray, cfgPath, sched, logger, paused, dnd, store))
-		}
 	}, store)
 }
 
-// startUIDispatcher 在独立 goroutine 锁定 OS 线程，按顺序消费 popupQueue。
-// webview2 库的 NewWithOptions/Run 强烈依赖"调用者线程有消息循环 + 在同一 OS 线程"。
-// 在这里我们锁定 OS 线程后，库内部 goroutine 会自动绑定到同一线程，避开主线程
-// 已被 systray.Run 占用的冲突。
+// startUIDispatcher 消费 popupQueue：每收到一个弹窗任务，就起一个独立的
+// goroutine（并锁定独立 OS 线程）去跑 ui.ShowPopup。这样：
+//  1) 单个弹窗若在 webview 里卡住（看门狗会在 popup.go 内强制关闭），不会阻塞
+//     其它弹窗，也不会影响主托盘线程 / 调度主循环；
+//  2) webview2 要求“调用者线程有消息循环且同一 OS 线程”，每个弹窗独占线程即可满足。
 func startUIDispatcher(logger *logging.Logger, sched *scheduler.ServiceScheduler, quoteTimeout time.Duration) {
 	go func() {
-		runtime.LockOSThread()
 		for job := range popupQueue {
-			logger.Printf("[ui] ShowPopup begin kind=%s", job.e.Kind)
-			// 诗词在 dispatcher 协程里取，不阻塞调度 tick 协程。
-			q := fetchQuote(sched.CurrentConfig(), quoteTimeout, logger)
-			logger.Printf("[ui] quote: %q", q.Text)
-			err := ui.ShowPopup(job.e, q, job.opts, logger)
-			if err != nil {
-				logger.Printf("[ui] ShowPopup failed: %v", err)
-				// 兜底：弹窗渲染失败时，用系统消息框展示提醒内容，
-				// 避免提醒静默丢失；仅首次失败时提示，避免消息框刷屏。
-				if webviewWarned.CompareAndSwap(false, true) {
-					showInfo(job.e.Title, job.e.Message)
-					cl := i18n.Lang(sched.CurrentConfig().Language)
-					showInfo(i18n.T(cl, "info.webview.title"), i18n.T(cl, "info.webview.msg"))
-				}
-			} else {
-				logger.Printf("[ui] ShowPopup OK")
-			}
+			go showPopupJob(job, logger, sched, quoteTimeout)
 		}
 	}()
 }
 
-func emitManual(sched *scheduler.ServiceScheduler) {
+// showPopupJob 在独立 OS 线程上展示一个弹窗；webview 失败时回退到系统消息框，
+// 保证提醒一定触达且窗口一定可关闭。
+func showPopupJob(job popupJob, logger *logging.Logger, sched *scheduler.ServiceScheduler, quoteTimeout time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("[ui] panic in ShowPopup: %v", r)
+		}
+	}()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	q := fetchQuote(sched.CurrentConfig(), quoteTimeout, logger)
+	logger.Printf("[ui] ShowPopup begin kind=%s", job.e.Kind)
+	err := ui.ShowPopup(job.e, q, job.opts, logger)
+	if err != nil {
+		logger.Printf("[ui] ShowPopup failed: %v", err)
+		// 原生兜底：webview 不可用时用系统消息框展示提醒内容（独立于 webview，
+		// 窗口一定可关闭），避免提醒静默丢失或留下卡死的 webview 窗口。
+		go showNativeReminder(job.e)
+	} else {
+		logger.Printf("[ui] ShowPopup OK")
+	}
+}
+
+// showNativeReminder 用系统 MessageBox 兜底展示提醒（webview 失败时使用）。
+func showNativeReminder(e scheduler.PopupEvent) {
+	title := e.Title
+	if strings.TrimSpace(title) == "" {
+		title = "PomodoroNotifier"
+	}
+	msg := e.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = i18n.T(i18n.Lang(""), "popup.msg_fallback")
+	}
+	showInfo(title, msg)
+}
+
+func emitManual(sched *scheduler.ServiceScheduler, logger *logging.Logger) {
+	if logger != nil {
+		logger.Printf("[tray] emitManual called")
+	}
 	lang := i18n.Lang(sched.CurrentConfig().Language)
 	e := scheduler.PopupEvent{
 		Kind:    "manual",
@@ -464,7 +488,7 @@ func reloadConfig(path string, sched *scheduler.ServiceScheduler, logger *loggin
 	return nil
 }
 
-func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging.Logger, onLangChange func()) {
+func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging.Logger) {
 	last, _ := os.Stat(path)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -477,8 +501,6 @@ func watchConfig(path string, sched *scheduler.ServiceScheduler, logger *logging
 			last = stat
 			if err := reloadConfig(path, sched, logger); err != nil {
 				logger.Printf("reload failed: %v", err)
-			} else if onLangChange != nil {
-				onLangChange()
 			}
 		}
 	}

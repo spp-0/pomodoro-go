@@ -79,6 +79,17 @@ func (t *Tray) SetMenu(menu *Menu) error {
 	return t.Platform.SetMenu(menu)
 }
 
+// RequestMenuRebuild asks the platform to rebuild the context menu (e.g. after
+// a locale change). Windows implements it by posting a message to the WndProc
+// thread; platforms without a safe mechanism simply ignore the request.
+func (t *Tray) RequestMenuRebuild(builder func() *Menu) {
+	if r, ok := t.Platform.(interface {
+		RequestMenuRebuild(func() *Menu)
+	}); ok {
+		r.RequestMenuRebuild(builder)
+	}
+}
+
 // Show makes the tray icon visible.
 func (t *Tray) Show() error {
 	t.Visible = true

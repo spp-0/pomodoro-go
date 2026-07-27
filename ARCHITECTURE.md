@@ -155,22 +155,30 @@ pomodoro-go/
                            ▼
         ┌──────────────────────────────────────┐
         │ startUIDispatcher goroutine          │
-        │   runtime.LockOSThread()             │ 锁住 OS 线程
-        │   for job := range popupQueue {      │ 同步阻塞消费
-        │       q := fetchQuote(cur, ...)      │ 在线 quote（**在 dispatcher 取，不阻塞 tick**）
-        │       ui.ShowPopup(job.e, q,        │ ← webview2 在这里
-        │                  job.opts)           │
+        │   for job := range popupQueue {      │ 只做分发，不阻塞
+        │       go showPopupJob(job, ...)      │ **每个弹窗一个独立 goroutine**
         │   }                                   │
         └──────────────────┬───────────────────┘
-                           │ ShowPopup 阻塞（20s auto-close 或用户点"知道了"）
+                           ▼
+        ┌──────────────────────────────────────┐
+        │ showPopupJob（每弹窗独立）           │
+        │   runtime.LockOSThread()             │ 独立 OS 线程（webview2 要求）
+        │   q := fetchQuote(cur, ...)          │ 在线 quote（不阻塞 tick/其他弹窗）
+        │   err := ui.ShowPopup(job.e, q, ...) │ ← webview2 在这里
+        │   if err != nil {                    │
+        │       go showNativeReminder(...)     │ 回退系统 MessageBox，提醒不丢失
+        │   }                                  │
+        └──────────────────┬───────────────────┘
                            ▼
         ┌──────────────────────────────────────┐
         │ ui.ShowPopup                         │
-        │   1) webview2.NewWithOptions(...)    │ 创建窗口
+        │   1) webview2.NewWithOptions(...)    │ 创建窗口（失败→返回 error）
         │   2) w.Bind("closeWindow", ...)      │ 注册 JS 回调
         │   3) w.SetHtml(html)                 │ 注入 HTML
-        │   4) w.Run()                         │ 阻塞直到关闭
-        │   5) w.Destroy()                     │ 清理
+        │   4) Go 侧 AutoCloseSeconds 定时器   │ **不依赖页面 JS**，到点强制 closeOnce
+        │   5) 看门狗（AutoClose+20s，≥30s）   │ 兜底 w.Destroy()，绝不永久挂死
+        │   6) w.Run()                         │ 阻塞直到关闭
+        │   7) w.Destroy()                     │ 清理
         └──────────────────┬───────────────────┘
                            │ ShowPopup return
                            ▼
@@ -185,12 +193,15 @@ pomodoro-go/
 |---|---|---|---|
 | **main goroutine** | 主线程（systray.Run） | 阻塞托盘消息循环 | **不能在这线程调 webview2** |
 | **tick goroutine** | `time.Ticker(1s)` 所在协程 | 短（emit 内做轻工作） | 调 `sched.Tick` |
-| **UI dispatcher** | `runtime.LockOSThread()` 独立 OS 线程 | 阻塞 ShowPopup（最长 auto_close 秒） | **唯一可以调 `ui.ShowPopup` 的地方** |
+| **UI dispatcher** | 普通 goroutine | 不阻塞（只分发） | 消费 `popupQueue`，每任务 `go showPopupJob` |
+| **showPopupJob（每弹窗一个）** | `runtime.LockOSThread()` 独立 OS 线程 | 阻塞 ShowPopup（最长 auto_close+20s 看门狗兜底） | **唯一可以调 `ui.ShowPopup` 的地方**；webview 失败回退 MessageBox |
 | **watch goroutine** | `time.Ticker(2s)` | 极短 | `os.Stat` 文件 mtime，调 `reloadConfig` |
-| **UI dispatcher 内部 fetchQuote** | 同步 `http.Get`（仅 dispatcher 线程） | 最多 1500ms | **不再阻塞 tick**；失败一律 `quote.Fallback()` |
+| **showPopupJob 内部 fetchQuote** | 同步 `http.Get`（弹窗自己的线程） | 最多 1500ms | **不阻塞 tick 和其他弹窗**；失败一律 `quote.Fallback()` |
 
-**为什么 UI dispatcher 要 LockOSThread**：
-`Krakinsight/go-webview2` 的 `NewWithOptions` 内部要起一个绑定到调用者线程的子 goroutine；如果主线程已经被 `systray.Run` 占用，库内部会失败或 hang。我们让 UI dispatcher 锁住自己的 OS 线程，让 webview2 子 goroutine 钉到这条线程上。
+**为什么每个弹窗要独立 LockOSThread 线程（而不是单一共享 dispatcher 线程）**：
+1. `Krakinsight/go-webview2` 的 `NewWithOptions` 要求调用者线程有消息循环，且窗口生命周期绑定该线程。
+2. 若所有弹窗串行共用一条 dispatcher 线程，**任何一个弹窗卡死都会拖垮全部后续弹窗**，且置顶的僵尸窗口会挡死托盘交互——表现为"程序整体卡死"。
+3. 每弹窗独立线程 + Go 侧 AutoClose 定时器 + 看门狗（`AutoCloseSeconds+20s`，下限 30s，`w.Destroy()` 走 WM_CLOSE→…→WM_QUIT 让 `Run()` 退出）三层兜底，保证单个弹窗故障被隔离且必然回收。
 
 **为什么不能在 emit 里直接 `go ui.ShowPopup`**：
 1. emit 在 tick goroutine 上跑，没有自己的消息循环

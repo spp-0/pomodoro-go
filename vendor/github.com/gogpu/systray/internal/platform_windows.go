@@ -52,6 +52,11 @@ const notifyIconVersion4 = 4
 // Each tray instance uses wmTrayCallback + its uid.
 const wmTrayCallback = 0x0400 + 100 // WM_USER + 100
 
+// wmRebuildMenu requests the context menu to be rebuilt on the WndProc
+// thread. Posted (not called directly) so that SetMenu runs on the same
+// thread that owns the HMENU, avoiding cross-thread races with showContextMenu.
+const wmRebuildMenu = 0x0400 + 101 // WM_USER + 101
+
 // Mouse messages used in tray wndProc (NOTIFYICON_VERSION_4 behavior).
 const (
 	wmLButtonUp     = 0x0202
@@ -227,6 +232,9 @@ type win32Tray struct {
 
 	callbacks *Callbacks
 	menu      *Menu // stored menu for rebuilding HMENU and dispatch
+
+	menuBuilder func() *Menu // rebuild request posted via wmRebuildMenu
+	menuShowing bool          // true while TrackPopupMenu is displaying
 }
 
 // NewPlatformTray creates a Win32 system tray implementation.
@@ -428,6 +436,31 @@ func (t *win32Tray) SetMenu(menu *Menu) error {
 	}
 
 	return nil
+}
+
+// RequestMenuRebuild stores a menu builder and posts wmRebuildMenu to the
+// tray window. The actual SetMenu happens inside the WndProc (doRebuildMenu),
+// on the thread that owns the HMENU — so callers may invoke this from any
+// goroutine without risking a cross-thread HMENU race.
+func (t *win32Tray) RequestMenuRebuild(builder func() *Menu) {
+	t.menuBuilder = builder
+	if t.hwnd != 0 {
+		procPostMessageW.Call(t.hwnd, uintptr(wmRebuildMenu), 0, 0)
+	}
+}
+
+// doRebuildMenu runs on the WndProc thread (via wmRebuildMenu) and rebuilds
+// the context menu so its labels reflect the current locale. If the menu is
+// currently displayed, the rebuild is deferred (re-posted) until it closes,
+// so we never DestroyMenu an HMENU that TrackPopupMenu is still using.
+func (t *win32Tray) doRebuildMenu() {
+	if t.menuShowing {
+		procPostMessageW.Call(t.hwnd, uintptr(wmRebuildMenu), 0, 0)
+		return
+	}
+	if t.menuBuilder != nil {
+		t.SetMenu(t.menuBuilder())
+	}
 }
 
 // ShowNotification displays a balloon notification from the tray icon.
@@ -861,6 +894,9 @@ func (t *win32Tray) handleTrayMessage(lParam uintptr) uintptr {
 
 	case wmContextMenu:
 		t.showContextMenu()
+
+	case wmRebuildMenu:
+		t.doRebuildMenu()
 	}
 
 	return 0
@@ -873,6 +909,8 @@ func (t *win32Tray) showContextMenu() {
 	if t.hmenu == 0 || t.menu == nil {
 		return
 	}
+	t.menuShowing = true
+	defer func() { t.menuShowing = false }()
 
 	// Get cursor position for menu placement.
 	var pt point

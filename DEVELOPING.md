@@ -397,8 +397,13 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 **解决**：如果真出现，**重新编译**（编译时加 `-ldflags "-H windowsgui -s -w"`），不要用控制台模式跑。
 
 ### 5.6 死锁（最严重）
-**症状**：日志停在 `[emit] called` / `[emit] popup: pos=...` 等某一行后面。
-**原因**：emit 链路上有人在持 `Scheduler.mu` 时调 `CurrentConfig()` / `State()` 等。
+**症状**：日志停在 `[emit] called` / `[emit] popup: pos=...` / `[tray] emitManual called` 等某一行后面，程序整体冻结、弹窗不出。
+**原因**：emit 链路上有人在持 `Scheduler.mu` 时调 `CurrentConfig()` / `State()` 等（`sync.Mutex` 不可重入 → 自死锁，锁永久不释放，之后所有 `CurrentConfig()` 全部阻塞）。
+**实际踩过的两个案例（v1.1.0 修复）**：
+1. `UpdateConfig` 持写锁时调用「立即补发时间点」的 emit，emit 闭包里又调 `sched.CurrentConfig()` → 自死锁。
+   修法：锁内 `collectImmediateTimepointsLocked` 只**收集**事件，解锁后再 `for … emit(e)`（与 `Tick` 的「锁内收集、锁外 emit」对齐）。
+2. `setStateLocked` 持锁时**同步**调状态监听回调，回调里又调 `sched.CurrentConfig()` → 自死锁。
+   修法：改为 `go fn(st)`，在锁外的独立 goroutine 调回调。
 **自检 checklist**：
 - [ ] 改 scheduler 时，所有 emit 调用都在锁外？
 - [ ] 改 main 时，所有 emit 闭包都用 `sched.CurrentConfig()` 而不是闭包捕获的 cfg？
@@ -468,14 +473,19 @@ Get-Process -Name PomodoroNotifier | Stop-Process
 
 ## 8. 依赖补丁（vendor 中的 systray）
 
-`github.com/gogpu/systray` 已 vendor 进仓库（见 `vendor/`）。对其 `internal/platform_windows.go`
-的 `Show()` 与 `modifyIcon()` 打了一处补丁：在 `uFlags` 末尾追加 `nifShovel`
-（=`NIF_SHOWTIP` 0x80）。原因：Windows 7+ 下不设这个标志，托盘图标的悬停
-tooltip（`szTip`）会被系统抑制，表现为「鼠标悬停无提示」。
+`github.com/gogpu/systray` 已 vendor 进仓库（见 `vendor/`），共打了 **两处补丁**：
 
-> ⚠️ 重新执行 `go mod vendor` 会用上游源码覆盖 `vendor/`，把该补丁冲掉，
-> 托盘提示会再次失效。若必须重 vendor，请手动把 `nid.uFlags = nifMessage | nifIcon | nifTip | nifShovel`
-> 这行重新打上；升级 systray 版本时同理需重新评估。
+1. **托盘 tooltip 修复**（`internal/platform_windows.go`）：`Show()` 与 `modifyIcon()`
+   的 `uFlags` 末尾追加 `nifShovel`（=`NIF_SHOWTIP` 0x80）。原因：Windows 7+ 下不设
+   这个标志，托盘图标的悬停 tooltip（`szTip`）会被系统抑制，表现为「鼠标悬停无提示」。
+2. **RebuildMenu 支持**（`systray.go` / `internal/tray.go` / `internal/platform_windows.go`）：
+   新增 `systray.RebuildMenu()` 导出函数与 `wmRebuildMenu` 自定义窗口消息，把「清空并
+   重建右键菜单」投递到托盘消息循环线程执行。用途：设置页切换显示语言后即时重建
+   本地化的托盘菜单（见 `cmd/pomodoro-agent/main.go` 的 `rebuildTrayMenu`）。
+
+> ⚠️ 重新执行 `go mod vendor` 会用上游源码覆盖 `vendor/`，把以上补丁**全部冲掉**：
+> 托盘提示会失效、`RebuildMenu` 会直接编译失败。若必须重 vendor，请对照 git 历史
+> 把两处补丁重新打上；升级 systray 版本时同理需重新评估。
 
 ---
 

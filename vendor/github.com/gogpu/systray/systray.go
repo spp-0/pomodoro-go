@@ -84,6 +84,15 @@ func (t *SystemTray) OnRightClick(fn func()) *SystemTray {
 	return t
 }
 
+// RebuildMenu requests the context menu to be rebuilt on the platform's UI
+// thread (Windows: posted as a window message so SetMenu runs inside the
+// tray's WndProc, avoiding cross-thread HMENU races). Safe to call from any
+// goroutine. Use it after the menu's labels need to change (e.g. locale switch).
+func (t *SystemTray) RebuildMenu(builder func() *Menu) *SystemTray {
+	t.impl.RequestMenuRebuild(func() *internal.Menu { return builder().impl })
+	return t
+}
+
 // ShowNotification displays an OS-level notification.
 func (t *SystemTray) ShowNotification(title, message string) *SystemTray {
 	_ = t.impl.ShowNotification(title, message)

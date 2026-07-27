@@ -202,14 +202,19 @@ func applySettings(configPath string, sched *scheduler.ServiceScheduler, logger 
 	if err := saveConfigAtomic(configPath, cfg); err != nil {
 		return i18n.T(newLang, "settings.err.save") + err.Error(), false
 	}
-	if loc, lerr := cfg.Location(); lerr == nil {
-		sched.UpdateConfig(cfg, loc)
-	} else {
-		sched.UpdateConfig(cfg, nil)
-	}
-	if onSaved != nil {
-		onSaved(cfg)
-	}
+	// 配置落盘后，把「热重载调度器 + 外部副作用（如注册表自启）」放到后台 goroutine 执行，
+	// 避免阻塞 webview2 的 UI 线程。UpdateConfig 会触发状态监听器，其中包含托盘图标更新等
+	// Win32 调用；在 webview 线程里同步调用曾与 Chromium UI 线程相互卡死（保存后窗口假死）。
+	go func(saved config.AppConfig) {
+		if loc, lerr := saved.Location(); lerr == nil {
+			sched.UpdateConfig(saved, loc)
+		} else {
+			sched.UpdateConfig(saved, nil)
+		}
+		if onSaved != nil {
+			onSaved(saved)
+		}
+	}(cfg)
 	logger.Printf("[settings] saved (lang=%s)", cfg.Language)
 	return "", true
 }

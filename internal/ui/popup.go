@@ -161,14 +161,17 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 	}
 	w.Dispatch(func() { forceForegroundPopup(uintptr(w.Window())) })
 
-	done := make(chan struct{})
 	closed := make(chan struct{})
 	var closedFlag atomic.Bool // 弹窗是否已关闭（异步天气注入时用来防抖）
+	// closeOnce 由 JS 的 closeWindow/snooze 或看门狗触发。
+	// 用 w.Destroy()（PostMessage WM_CLOSE）而非直接在任意线程调 Terminate：
+	// WM_CLOSE 由 WndProc 在 Run() 所在线程处理，进而 DestroyWindow→WM_DESTROY→
+	// Terminate(PostQuitMessage)，保证 Run() 的消息循环一定退出。
 	closeOnce := func() {
-		closedFlag.Store(true)
-		// 1) 关闭 webview 窗口
+		if !closedFlag.CompareAndSwap(false, true) {
+			return
+		}
 		w.Destroy()
-		// 2) 通知 Run() 退出（不调 Terminate，避免它强行结束宿主进程）
 		select {
 		case <-closed:
 		default:
@@ -230,19 +233,41 @@ func ShowPopup(e scheduler.PopupEvent, q quote.Quote, opt Options, log *logging.
 	if opt.SoundEnabled {
 		playNotificationSound(opt.SoundFile)
 	}
+
+	// Go 侧兜底自动关闭：即使页面 JS 未执行（webview 初始化异常 / 脚本未运行），
+	// 也在到达 AutoCloseSeconds 时强制关闭窗口。这样弹窗不会长时间滞留，
+	// 与 JS 里的自动倒计时形成双保险（JS 先触发则本定时器变为空操作）。
+	if opt.AutoCloseSeconds > 0 {
+		go func() {
+			time.Sleep(time.Duration(opt.AutoCloseSeconds) * time.Second)
+			closeOnce()
+		}()
+	}
+
+	// 看门狗：webview 若因运行时缺失/初始化异常导致页面 JS 未执行，
+	// closeWindow 永远不被调用，Run() 的 GetMessage 循环将永久阻塞，
+	// 并留下一个（可能不可见但置顶的）窗口，使程序“假死”。
+	// 这里在窗口最长存活时间后强制关闭，保证 Run() 一定返回、OS 线程一定释放。
+	maxLife := time.Duration(opt.AutoCloseSeconds+20) * time.Second
+	if maxLife < 30*time.Second {
+		maxLife = 30 * time.Second
+	}
 	go func() {
-		<-done
+		time.Sleep(maxLife)
+		if log != nil {
+			log.Printf("[ui] watchdog: forcing popup close after %s (kind=%s)", maxLife, e.Kind)
+		}
+		closeOnce()
 	}()
+
 	w.Run()
 
-	// 兜底：让 closeWindow 回调把窗口关掉后，再让 ShowPopup 返回
+	// Run() 返回后，确保 closed 已被关闭（看门狗/JS 任一路径都会关，这里兜底）。
 	select {
 	case <-closed:
-	case <-time.After(2 * time.Second):
-		// 2s 还没收到 close 信号（用户没点按钮），强制 Destroy
-		w.Destroy()
+	default:
+		close(closed)
 	}
-	close(done)
 	return nil
 }
 
